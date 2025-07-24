@@ -64,6 +64,10 @@ Modify the `BenchmarkConfig` struct in `main.cu` to tweak:
 
 Recompile after changes.
 
+## Notes
+
+I have a lot of other projects i need to create and maintain. expect delayed bugfixes / features / responses.
+
 ## Licence
 
 This project is licensed under the Apache License 2.0. See [LICENSE](https://www.apache.org/licenses/LICENSE-2.0) for details.
