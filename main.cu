@@ -41,7 +41,9 @@
 #include <chrono>
 #include <iostream>
 #include <vector>
-#include <conio.h>
+#ifdef _WIN32
+    #include <conio.h>
+#endif
 #include <mma.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -90,6 +92,27 @@
         } \
     } while (0)
 
+#ifndef _WIN32
+#include <termios.h>
+
+int getch(void) {
+    struct termios oldattr, newattr;
+    int ch;
+
+    tcgetattr(STDIN_FILENO, &oldattr);             // Get current terminal attributes
+    newattr = oldattr;
+    newattr.c_lflag &= ~(ICANON | ECHO);           // Disable canonical mode and echo
+    tcsetattr(STDIN_FILENO, TCSANOW, &newattr);    // Set new attributes
+
+    ch = getchar();                                // Read one character
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldattr);    // Restore old attributes
+    return ch;
+}
+
+#define _getch() getch()
+
+#endif
 
 // Vector math utility functions
 __device__ __host__ float3 normalize(float3 v) {
