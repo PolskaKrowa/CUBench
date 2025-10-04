@@ -71,9 +71,6 @@ I have a lot of other projects i need to create and maintain. expect delayed bug
 ### Planned features
 
 ```
-Large page migration between host and device (on-demand memory)
-Synchronisation and Scheduling overhead (Cooperative Groups Performance)
-Specialised Unit testing (RT cores, Tensor cores, etc.)
 NUMA & NVLink Bandwidth
 Rewrite all benchmarks to test all GPUs and get average or individual results
 GPU power efficiency (GFLOPs/W under light and heavy sustained loads to measure clock drop-off)
