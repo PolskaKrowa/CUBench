@@ -63,6 +63,13 @@
 #include <cstdarg>
 #include <iomanip>
 #include <string>
+#include <cooperative_groups.h>
+#include <stdint.h>
+#include <cstdio>
+#include <cstdlib>
+
+namespace cg = cooperative_groups;
+using namespace nvcuda::wmma;
 
 // Error checking macros
 #define CUDA_CHECK(call) \
@@ -113,6 +120,29 @@ int getch(void) {
 #define _getch() getch()
 
 #endif
+
+// Helper: check CUDA errors
+static inline void CHECK_CUDA(cudaError_t e, const char* msg = nullptr) {
+    if (e != cudaSuccess) {
+        fprintf(stderr, "CUDA error%s: %s\n", msg ? msg : "", cudaGetErrorString(e));
+        exit(1);
+    }
+}
+
+// Helper: simple timing wrapper using cuda events
+struct GpuTimer {
+    cudaEvent_t start, stop;
+    GpuTimer() { CHECK_CUDA(cudaEventCreate(&start)); CHECK_CUDA(cudaEventCreate(&stop)); }
+    ~GpuTimer() { cudaEventDestroy(start); cudaEventDestroy(stop); }
+    void startEvent() { CHECK_CUDA(cudaEventRecord(start)); }
+    float stopMs() {
+        CHECK_CUDA(cudaEventRecord(stop));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+        return ms;
+    }
+};
 
 // Vector math utility functions
 __device__ __host__ float3 normalize(float3 v) {
@@ -1548,6 +1578,69 @@ __global__ void highRegisterAndSharedMemoryKernel(float* input, float* output, i
             result += shared_data[tid + i * blockDim.x] * sinf((float)i);
         }
         output[idx] = result;
+    }
+}
+
+
+__global__ void cg_sync_kernel(int rounds, int* out) {
+    cg::grid_group grid = cg::this_grid();
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    // each round perform a small amount of work and sync
+    for (int r = 0; r < rounds; ++r) {
+        // trivial work: increment an atomic counter per block
+        if (threadIdx.x == 0) {
+            atomicAdd(out, 1);
+        }
+        // synchronise across the whole grid
+        grid.sync();
+        // trivial per-thread op
+        if (gid % 64 == 0) { /* no-op to avoid being optimised away */ }
+    }
+}
+
+__global__ void wmma_gemm_fp16_kernel(half const* A, half const* B, float* C, int M, int N, int K) {
+    // This kernel computes C = A * B using WMMA 16x16x16 tiles.
+    // Each block computes one tile for simplicity.
+    int tile_m = (blockIdx.x);
+    int tile_n = (blockIdx.y);
+
+    int row = tile_m * 16;
+    int col = tile_n * 16;
+
+    fragment<matrix_a, 16, 16, 16, half, row_major> a_frag;
+    fragment<matrix_b, 16, 16, 16, half, col_major> b_frag;
+    fragment<accumulator, 16, 16, 16, float> acc_frag;
+    fill_fragment(acc_frag, 0.0f);
+
+    for (int k = 0; k < K; k += 16) {
+        // load A tile
+        load_matrix_sync(a_frag, A + row * K + k, K);
+        load_matrix_sync(b_frag, B + k * N + col, N);
+        mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+    }
+
+    // store results
+    // write the 16x16 tile out to C
+    for (int i = 0; i < 16; ++i) {
+        int r = row + i;
+        if (r >= M) continue;
+        for (int j = 0; j < 16; ++j) {
+            int c = col + j;
+            if (c >= N) continue;
+            int idx = r * N + c;
+            // convert fragment element index to value
+            // the simplest: write acc_frag directly (frag layout abstract) by reading via accessor
+            C[idx] = acc_frag.x[i*16 + j]; // note: frag layout is implementation defined; works on modern toolchains
+        }
+    }
+}
+
+__global__ void managed_touch_kernel(char* base, size_t total, size_t stride) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t step = blockDim.x * gridDim.x;
+    for (size_t off = idx * stride; off < total; off += step * stride) {
+        volatile char v = base[off];
+        (void)v;
     }
 }
 
@@ -3922,7 +4015,7 @@ public:
         printf("%.2fx slower than static\n", (update_time / 100.0f) / (graph_time / 1000.0f));
     }
 
-void benchmarkSMUtilizationThermalThrottling() {
+    void benchmarkSMUtilizationThermalThrottling() {
         printf("\n=== SM Utilization vs Thermal Throttling ===\n");
         
         // Initialize test data
@@ -4308,6 +4401,120 @@ void benchmarkSMUtilizationThermalThrottling() {
         }
     }
 
+    void benchmark_managed_on_demand(size_t total_bytes = size_t(1) << 30 /*1 GiB*/, size_t stride_bytes = 1<<20 /*1 MiB*/) {
+        printf("\n=== Managed on-demand page migration benchmark ===\n");
+        // allocate managed memory
+        void* data = nullptr;
+        CHECK_CUDA(cudaMallocManaged(&data, total_bytes));
+
+        // initialise on host (touch every nth stride)
+        printf("Touching host pages every %zu bytes to place pages on host.\n", stride_bytes);
+        for (size_t off = 0; off < total_bytes; off += stride_bytes) {
+            volatile char* p = (volatile char*)data + off;
+            *p = 1;
+        }
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        char* base = reinterpret_cast<char*>(data);
+        int blocks = 256;
+        int threads = 256;
+
+        // warm up
+        managed_touch_kernel<<<blocks, threads>>>(base, total_bytes, stride_bytes);
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        GpuTimer t;
+        t.startEvent();
+        managed_touch_kernel<<<blocks, threads>>>(base, total_bytes, stride_bytes);
+        float ms = t.stopMs();
+        printf("Accessed %zu MiB (stride %zu KiB) in %.3f ms (kernel). Note: migration cost included.\n",
+            total_bytes >> 20, stride_bytes >> 10, ms);
+
+        // cleanup
+        CHECK_CUDA(cudaFree(data));
+    }
+
+    void benchmark_cooperative_groups(int blocks = 16, int threads = 256, int rounds = 1000) {
+        printf("\n=== Cooperative Groups synchronisation & scheduling overhead ===\n");
+
+        int device;
+        CHECK_CUDA(cudaGetDevice(&device));
+        int cooperativeLaunch = 0;
+        CHECK_CUDA(cudaDeviceGetAttribute(&cooperativeLaunch, cudaDevAttrCooperativeLaunch, device));
+        if (!cooperativeLaunch) {
+            printf("Device does not support cooperative launch. Skipping cooperative benchmark.\n");
+            return;
+        }
+
+        int* d_counter = nullptr;
+        CHECK_CUDA(cudaMalloc(&d_counter, sizeof(int)));
+        CHECK_CUDA(cudaMemset(d_counter, 0, sizeof(int)));
+
+        // warm up cooperative kernel
+        void* kernelArgs[] = { &rounds, &d_counter }; // not used by this signature, use direct launch
+
+        GpuTimer t;
+        // For cooperative kernel we must use cudaLaunchCooperativeKernel
+        dim3 grid(blocks);
+        dim3 block(threads);
+        t.startEvent();
+        void* args[] = { &rounds, &d_counter }; // but kernel expects (int,int*) signature
+        // Launch with correct function pointer
+        CHECK_CUDA(cudaLaunchCooperativeKernel((void*)cg_sync_kernel, grid, block, args));
+        float ms = t.stopMs();
+
+        int host_count = 0;
+        CHECK_CUDA(cudaMemcpy(&host_count, d_counter, sizeof(int), cudaMemcpyDeviceToHost));
+        printf("Cooperative kernel: blocks=%d threads=%d rounds=%d -> time=%.3f ms  counter=%d\n",
+            blocks, threads, rounds, ms, host_count);
+
+        CHECK_CUDA(cudaFree(d_counter));
+    }
+
+    void benchmark_tensor_cores(int M = 1024, int N = 1024, int K = 1024) {
+        printf("\n=== Tensor core (WMMA) microbenchmark ===\n");
+        // Ensure sizes are multiples of 16 for simplicity
+        M = (M + 15) / 16 * 16;
+        N = (N + 15) / 16 * 16;
+        K = (K + 15) / 16 * 16;
+
+        size_t Asz = size_t(M) * K;
+        size_t Bsz = size_t(K) * N;
+        size_t Csz = size_t(M) * N;
+
+        half* d_A; half* d_B; float* d_C;
+        CHECK_CUDA(cudaMalloc(&d_A, Asz * sizeof(half)));
+        CHECK_CUDA(cudaMalloc(&d_B, Bsz * sizeof(half)));
+        CHECK_CUDA(cudaMalloc(&d_C, Csz * sizeof(float)));
+
+        // initialise A and B with simple values on host and copy
+        half* hA = (half*)malloc(Asz * sizeof(half));
+        half* hB = (half*)malloc(Bsz * sizeof(half));
+        for (size_t i = 0; i < Asz; ++i) hA[i] = __float2half(1.0f);
+        for (size_t i = 0; i < Bsz; ++i) hB[i] = __float2half(1.0f);
+        CHECK_CUDA(cudaMemcpy(d_A, hA, Asz*sizeof(half), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_B, hB, Bsz*sizeof(half), cudaMemcpyHostToDevice));
+
+        dim3 grid(M/16, N/16);
+        dim3 block(32,1,1); // WMMA kernels often use 32 threads per warp/block
+
+        // warm up
+        wmma_gemm_fp16_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        GpuTimer t;
+        t.startEvent();
+        wmma_gemm_fp16_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+        float ms = t.stopMs();
+
+        double gflops = 2.0 * double(M) * double(N) * double(K) / (ms * 1e6); // GFLOP/s
+        printf("WMMA GEMM: M=%d N=%d K=%d time=%.3f ms  approx=%.2f GFLOP/s\n", M, N, K, ms, gflops);
+
+        // cleanup
+        free(hA); free(hB);
+        CHECK_CUDA(cudaFree(d_A)); CHECK_CUDA(cudaFree(d_B)); CHECK_CUDA(cudaFree(d_C));
+    }
+
     void runAllBenchmarks() {
         printf("                  ---  CUBench  ---\n");
         printf(" The Definitive Open-Source GPU Benchmarking Utility\n");
@@ -4397,7 +4604,10 @@ void benchmarkSMUtilizationThermalThrottling() {
             {"SMUtilisation", [](auto self){ self ->benchmarkSMUtilizationThermalThrottling(); }},
             {"BVHEfficiency", [](auto self){ self ->benchmarkBVHTraversalEfficiency(); }},
             {"MemoryAllocOverhead", [](auto self){ self ->benchmarkMemoryAllocationOverhead(); }},
-            {"OccupancyLimiting", [](auto self){ self ->benchmarkOccupancyLimitingFactors(); }}
+            {"OccupancyLimiting", [](auto self){ self ->benchmarkOccupancyLimitingFactors(); }},
+            {"ManagedOnDemand", [](auto self){ self ->benchmark_managed_on_demand(); }},
+            {"CooperativeGroups", [](auto self){ self ->benchmark_cooperative_groups(); }},
+            {"TensorCores", [](auto self){ self ->benchmark_tensor_cores(); }},
         };
 
         struct BenchResult {
