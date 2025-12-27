@@ -26,13 +26,13 @@ A comprehensive CUDA-based tool for evaluating GPU performance across a variety 
 2. Compile with NVCC:
 
    ```bash
-   nvcc -std=c++17 main.cu -o cubench -lcusparse -lcufft
+   nvcc -std=c++17 main.cu -o cubench -lcusparse -lcufft --extended-lambda --rdc=true
    ```
 
 3. (Optional) Add optimisation flags:
 
    ```bash
-   nvcc -O3 -std=c++17 main.cu -o cubench -lcusparse -lcufft
+   nvcc -O3 -std=c++17 main.cu -o cubench -lcusparse -lcufft --extended-lambda --rdc=true
    ```
 
 ## Usage
