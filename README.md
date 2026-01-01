@@ -17,7 +17,7 @@ A comprehensive CUDA-based tool for evaluating GPU performance across a variety 
 * CUDA Toolkit (version 11.0 or later)
 * NVCC compiler
 * C++17-compatible standard library
-* A CUDA-capable GPU
+* 1 or more CUDA-capable GPUs
 
 ## Building
 
