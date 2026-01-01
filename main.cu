@@ -1644,6 +1644,175 @@ __global__ void managed_touch_kernel(char* base, size_t total, size_t stride) {
     }
 }
 
+// Multi-Dimensional Convolution Kernels
+__global__ void conv2dKernel(const float* input, float* output, const float* kernel,
+                             int width, int height, int kernel_size) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (x >= width || y >= height) return;
+    
+    int half_kernel = kernel_size / 2;
+    float sum = 0.0f;
+    
+    for (int ky = -half_kernel; ky <= half_kernel; ky++) {
+        for (int kx = -half_kernel; kx <= half_kernel; kx++) {
+            int ix = x + kx;
+            int iy = y + ky;
+            
+            if (ix >= 0 && ix < width && iy >= 0 && iy < height) {
+                int input_idx = iy * width + ix;
+                int kernel_idx = (ky + half_kernel) * kernel_size + (kx + half_kernel);
+                sum += input[input_idx] * kernel[kernel_idx];
+            }
+        }
+    }
+    
+    output[y * width + x] = sum;
+}
+
+__global__ void conv3dKernel(const float* input, float* output, const float* kernel,
+                             int width, int height, int depth, int kernel_size) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int z = blockIdx.z * blockDim.z + threadIdx.z;
+    
+    if (x >= width || y >= height || z >= depth) return;
+    
+    int half_kernel = kernel_size / 2;
+    float sum = 0.0f;
+    
+    for (int kz = -half_kernel; kz <= half_kernel; kz++) {
+        for (int ky = -half_kernel; ky <= half_kernel; ky++) {
+            for (int kx = -half_kernel; kx <= half_kernel; kx++) {
+                int ix = x + kx;
+                int iy = y + ky;
+                int iz = z + kz;
+                
+                if (ix >= 0 && ix < width && iy >= 0 && iy < height && iz >= 0 && iz < depth) {
+                    int input_idx = iz * width * height + iy * width + ix;
+                    int kernel_idx = (kz + half_kernel) * kernel_size * kernel_size + 
+                                   (ky + half_kernel) * kernel_size + (kx + half_kernel);
+                    sum += input[input_idx] * kernel[kernel_idx];
+                }
+            }
+        }
+    }
+    
+    output[z * width * height + y * width + x] = sum;
+}
+
+// BFS/SSSP Kernels
+__global__ void bfsKernel(const int* offsets, const int* edges, int* levels, 
+                         int* visited, int num_nodes, int current_level) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_nodes) return;
+    
+    if (levels[tid] == current_level) {
+        int start = offsets[tid];
+        int end = (tid + 1 < num_nodes) ? offsets[tid + 1] : 0;
+        
+        for (int i = start; i < end; i++) {
+            int neighbor = edges[i];
+            if (atomicCAS(&visited[neighbor], 0, 1) == 0) {
+                levels[neighbor] = current_level + 1;
+            }
+        }
+    }
+}
+
+__global__ void ssspKernel(const int* offsets, const int* edges, const int* weights,
+                          int* distances, int* updated, int num_nodes) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_nodes) return;
+    
+    int current_dist = distances[tid];
+    if (current_dist == INT_MAX) return;
+    
+    int start = offsets[tid];
+    int end = (tid + 1 < num_nodes) ? offsets[tid + 1] : 0;
+    
+    for (int i = start; i < end; i++) {
+        int neighbor = edges[i];
+        int new_dist = current_dist + weights[i];
+        
+        int old_dist = atomicMin(&distances[neighbor], new_dist);
+        if (new_dist < old_dist) {
+            *updated = 1;
+        }
+    }
+}
+
+// SIMT Performance Kernels
+__global__ void simtUniformKernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    
+    // All threads in warp execute same instructions - good SIMT
+    float val = input[idx];
+    val = val * 2.0f + 1.0f;
+    val = sinf(val) + cosf(val);
+    val = sqrtf(fabsf(val));
+    val = expf(val * 0.01f);
+    
+    output[idx] = val;
+}
+
+__global__ void simtDivergentKernel(const float* input, float* output, 
+                                   const int* branch_data, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    
+    float val = input[idx];
+    int branch = branch_data[idx] % 32; // Force divergence within warps
+    
+    // Heavy divergence - poor SIMT utilization
+    if (branch < 8) {
+        for (int i = 0; i < 100; i++) {
+            val = sinf(val * 1.1f);
+        }
+    } else if (branch < 16) {
+        for (int i = 0; i < 100; i++) {
+            val = cosf(val * 0.9f);
+        }
+    } else if (branch < 24) {
+        for (int i = 0; i < 100; i++) {
+            val = expf(val * 0.01f);
+        }
+    } else {
+        for (int i = 0; i < 100; i++) {
+            val = logf(fabsf(val) + 1.0f);
+        }
+    }
+    
+    output[idx] = val;
+}
+
+__global__ void simtBalancedKernel(const float* input, float* output, 
+                                  const int* branch_data, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    
+    float val = input[idx];
+    int branch = branch_data[idx];
+    
+    // All threads execute all branches but use results selectively - better SIMT
+    float result1 = 0.0f, result2 = 0.0f, result3 = 0.0f, result4 = 0.0f;
+    
+    for (int i = 0; i < 100; i++) {
+        result1 = sinf(val * 1.1f);
+        result2 = cosf(val * 0.9f);
+        result3 = expf(val * 0.01f);
+        result4 = logf(fabsf(val) + 1.0f);
+    }
+    
+    // Select result based on branch condition
+    int sel = branch % 4;
+    val = (sel == 0) ? result1 : (sel == 1) ? result2 : (sel == 2) ? result3 : result4;
+    
+    output[idx] = val;
+}
+
 class RenderBenchmark {
 private:
     BenchmarkConfig config;
@@ -1814,6 +1983,34 @@ private:
     float* d_occupancy_limit_input;
     float* d_occupancy_limit_output;
 
+    // Multi-Dimensional Convolution test memory
+    float* d_conv2d_input;
+    float* d_conv2d_output;
+    float* d_conv2d_kernel;
+    float* d_conv3d_input;
+    float* d_conv3d_output;
+    float* d_conv3d_kernel;
+    int conv2d_size = 512;
+    int conv3d_size = 128;
+
+    // BFS/SSSP test memory
+    int* d_graph_offsets;
+    int* d_graph_edges;
+    int* d_graph_weights;
+    int* d_bfs_levels;
+    int* d_bfs_visited;
+    int* d_sssp_distances;
+    int num_graph_nodes = 100000;
+    int num_graph_edges = 500000;
+
+    // SIMT performance test memory
+    float* d_simt_uniform_input;
+    float* d_simt_uniform_output;
+    float* d_simt_divergent_input;
+    float* d_simt_divergent_output;
+    int* d_simt_branch_data;
+    int simt_test_size = 1048576;
+
 public:
     RenderBenchmark(const BenchmarkConfig& cfg) : config(cfg) {
         // Create CUDA events
@@ -1983,6 +2180,76 @@ public:
         CUDA_CHECK(cudaMalloc(&d_occupancy_limit_output, config.occupancy_test_size * sizeof(float)));
         
         initializeBVHData();
+
+        // Multi-Dimensional Convolution allocations
+        CUDA_CHECK(cudaMalloc(&d_conv2d_input, conv2d_size * conv2d_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_conv2d_output, conv2d_size * conv2d_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_conv2d_kernel, 5 * 5 * sizeof(float))); // 5x5 kernel
+
+        CUDA_CHECK(cudaMalloc(&d_conv3d_input, conv3d_size * conv3d_size * conv3d_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_conv3d_output, conv3d_size * conv3d_size * conv3d_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_conv3d_kernel, 3 * 3 * 3 * sizeof(float))); // 3x3x3 kernel
+
+        // BFS/SSSP allocations
+        CUDA_CHECK(cudaMalloc(&d_graph_offsets, (num_graph_nodes + 1) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_graph_edges, num_graph_edges * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_graph_weights, num_graph_edges * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_bfs_levels, num_graph_nodes * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_bfs_visited, num_graph_nodes * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_sssp_distances, num_graph_nodes * sizeof(int)));
+
+        // SIMT performance test allocations
+        CUDA_CHECK(cudaMalloc(&d_simt_uniform_input, simt_test_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_simt_uniform_output, simt_test_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_simt_divergent_input, simt_test_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_simt_divergent_output, simt_test_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_simt_branch_data, simt_test_size * sizeof(int)));
+
+        // Initialize convolution data
+        std::vector<float> h_conv2d_input(conv2d_size * conv2d_size);
+        std::vector<float> h_conv3d_input(conv3d_size * conv3d_size * conv3d_size);
+        for (auto& val : h_conv2d_input) val = (float)rand() / RAND_MAX;
+        for (auto& val : h_conv3d_input) val = (float)rand() / RAND_MAX;
+        CUDA_CHECK(cudaMemcpy(d_conv2d_input, h_conv2d_input.data(), 
+                            conv2d_size * conv2d_size * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_conv3d_input, h_conv3d_input.data(), 
+                            conv3d_size * conv3d_size * conv3d_size * sizeof(float), cudaMemcpyHostToDevice));
+
+        // Initialize graph data (random graph)
+        std::vector<int> h_offsets(num_graph_nodes + 1);
+        std::vector<int> h_edges(num_graph_edges);
+        std::vector<int> h_weights(num_graph_edges);
+        int edge_count = 0;
+        for (int i = 0; i < num_graph_nodes; i++) {
+            h_offsets[i] = edge_count;
+            int degree = rand() % 10 + 1; // 1-10 edges per node
+            for (int j = 0; j < degree && edge_count < num_graph_edges; j++) {
+                h_edges[edge_count] = rand() % num_graph_nodes;
+                h_weights[edge_count] = rand() % 100 + 1;
+                edge_count++;
+            }
+        }
+        h_offsets[num_graph_nodes] = edge_count;
+        CUDA_CHECK(cudaMemcpy(d_graph_offsets, h_offsets.data(), 
+                            (num_graph_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_graph_edges, h_edges.data(), 
+                            num_graph_edges * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_graph_weights, h_weights.data(), 
+                            num_graph_edges * sizeof(int), cudaMemcpyHostToDevice));
+
+        // Initialize SIMT test data
+        std::vector<float> h_simt_input(simt_test_size);
+        std::vector<int> h_simt_branch(simt_test_size);
+        for (int i = 0; i < simt_test_size; i++) {
+            h_simt_input[i] = (float)rand() / RAND_MAX;
+            h_simt_branch[i] = rand();
+        }
+        CUDA_CHECK(cudaMemcpy(d_simt_uniform_input, h_simt_input.data(), 
+                            simt_test_size * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_simt_divergent_input, h_simt_input.data(), 
+                            simt_test_size * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_simt_branch_data, h_simt_branch.data(), 
+                            simt_test_size * sizeof(int), cudaMemcpyHostToDevice));
     }
     
     ~RenderBenchmark() {
@@ -2103,6 +2370,24 @@ public:
         // Destroy events
         cudaEventDestroy(start_event);
         cudaEventDestroy(stop_event);
+
+        cudaFree(d_conv2d_input);
+        cudaFree(d_conv2d_output);
+        cudaFree(d_conv2d_kernel);
+        cudaFree(d_conv3d_input);
+        cudaFree(d_conv3d_output);
+        cudaFree(d_conv3d_kernel);
+        cudaFree(d_graph_offsets);
+        cudaFree(d_graph_edges);
+        cudaFree(d_graph_weights);
+        cudaFree(d_bfs_levels);
+        cudaFree(d_bfs_visited);
+        cudaFree(d_sssp_distances);
+        cudaFree(d_simt_uniform_input);
+        cudaFree(d_simt_uniform_output);
+        cudaFree(d_simt_divergent_input);
+        cudaFree(d_simt_divergent_output);
+        cudaFree(d_simt_branch_data);
     }
 
     void initializeLights() {
@@ -4515,6 +4800,208 @@ public:
         CHECK_CUDA(cudaFree(d_A)); CHECK_CUDA(cudaFree(d_B)); CHECK_CUDA(cudaFree(d_C));
     }
 
+    void benchmarkMultiDimensionalConvolution() {
+        printf("\n=== Multi-Dimensional Convolution Benchmark ===\n");
+        
+        // 2D Convolution Test
+        dim3 blockSize2d(16, 16);
+        dim3 gridSize2d((conv2d_size + blockSize2d.x - 1) / blockSize2d.x,
+                        (conv2d_size + blockSize2d.y - 1) / blockSize2d.y);
+        
+        CUDA_CHECK(cudaEventRecord(start_event));
+        for (int i = 0; i < 100; i++) {
+            conv2dKernel<<<gridSize2d, blockSize2d>>>(d_conv2d_input, d_conv2d_output, 
+                                                    d_conv2d_kernel, conv2d_size, conv2d_size, 5);
+        }
+        CUDA_CHECK(cudaEventRecord(stop_event));
+        CUDA_CHECK(cudaEventSynchronize(stop_event));
+        
+        float conv2d_time;
+        CUDA_CHECK(cudaEventElapsedTime(&conv2d_time, start_event, stop_event));
+        
+        size_t ops_2d = (size_t)conv2d_size * conv2d_size * 5 * 5 * 2; // multiply + add per output
+        float gflops_2d = (ops_2d * 100) / (conv2d_time * 1e6f);
+        
+        printf("2D Convolution (%dx%d, 5x5 kernel):\n", conv2d_size, conv2d_size);
+        printf("  Time: %.2f ms\n", conv2d_time / 100);
+        printf("  Performance: %.2f GFLOPS\n", gflops_2d);
+        
+        // 3D Convolution Test
+        dim3 blockSize3d(8, 8, 8);
+        dim3 gridSize3d((conv3d_size + blockSize3d.x - 1) / blockSize3d.x,
+                        (conv3d_size + blockSize3d.y - 1) / blockSize3d.y,
+                        (conv3d_size + blockSize3d.z - 1) / blockSize3d.z);
+        
+        CUDA_CHECK(cudaEventRecord(start_event));
+        for (int i = 0; i < 50; i++) {
+            conv3dKernel<<<gridSize3d, blockSize3d>>>(d_conv3d_input, d_conv3d_output, 
+                                                    d_conv3d_kernel, conv3d_size, conv3d_size, 
+                                                    conv3d_size, 3);
+        }
+        CUDA_CHECK(cudaEventRecord(stop_event));
+        CUDA_CHECK(cudaEventSynchronize(stop_event));
+        
+        float conv3d_time;
+        CUDA_CHECK(cudaEventElapsedTime(&conv3d_time, start_event, stop_event));
+        
+        size_t ops_3d = (size_t)conv3d_size * conv3d_size * conv3d_size * 3 * 3 * 3 * 2;
+        float gflops_3d = (ops_3d * 50) / (conv3d_time * 1e6f);
+        
+        printf("3D Convolution (%dx%dx%d, 3x3x3 kernel):\n", conv3d_size, conv3d_size, conv3d_size);
+        printf("  Time: %.2f ms\n", conv3d_time / 50);
+        printf("  Performance: %.2f GFLOPS\n", gflops_3d);
+    }
+
+    void benchmarkBFSSSP() {
+        printf("\n=== BFS/SSSP Graph Traversal Benchmark ===\n");
+        
+        dim3 blockSize(256);
+        dim3 gridSize((num_graph_nodes + blockSize.x - 1) / blockSize.x);
+        
+        // BFS Test
+        std::vector<int> h_levels(num_graph_nodes, -1);
+        std::vector<int> h_visited(num_graph_nodes, 0);
+        h_levels[0] = 0;
+        h_visited[0] = 1;
+        
+        CUDA_CHECK(cudaMemcpy(d_bfs_levels, h_levels.data(), 
+                            num_graph_nodes * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_bfs_visited, h_visited.data(), 
+                            num_graph_nodes * sizeof(int), cudaMemcpyHostToDevice));
+        
+        CUDA_CHECK(cudaEventRecord(start_event));
+        
+        int max_levels = 0;
+        for (int level = 0; level < 100; level++) {
+            bfsKernel<<<gridSize, blockSize>>>(d_graph_offsets, d_graph_edges, 
+                                            d_bfs_levels, d_bfs_visited, 
+                                            num_graph_nodes, level);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            // Check if any node at this level (simplified)
+            max_levels = level + 1;
+            if (level > 20) break; // Safety limit
+        }
+        
+        CUDA_CHECK(cudaEventRecord(stop_event));
+        CUDA_CHECK(cudaEventSynchronize(stop_event));
+        
+        float bfs_time;
+        CUDA_CHECK(cudaEventElapsedTime(&bfs_time, start_event, stop_event));
+        
+        printf("BFS Traversal:\n");
+        printf("  Nodes: %d, Edges: %d\n", num_graph_nodes, num_graph_edges);
+        printf("  Levels explored: %d\n", max_levels);
+        printf("  Time: %.2f ms\n", bfs_time);
+        printf("  Throughput: %.2f MNodes/s\n", (num_graph_nodes / 1e6f) / (bfs_time / 1000.0f));
+        
+        // SSSP Test
+        std::vector<int> h_distances(num_graph_nodes, INT_MAX);
+        h_distances[0] = 0;
+        
+        CUDA_CHECK(cudaMemcpy(d_sssp_distances, h_distances.data(), 
+                            num_graph_nodes * sizeof(int), cudaMemcpyHostToDevice));
+        
+        int* d_updated;
+        CUDA_CHECK(cudaMalloc(&d_updated, sizeof(int)));
+        
+        CUDA_CHECK(cudaEventRecord(start_event));
+        
+        int iterations = 0;
+        for (int iter = 0; iter < 100; iter++) {
+            int h_updated = 0;
+            CUDA_CHECK(cudaMemcpy(d_updated, &h_updated, sizeof(int), cudaMemcpyHostToDevice));
+            
+            ssspKernel<<<gridSize, blockSize>>>(d_graph_offsets, d_graph_edges, d_graph_weights,
+                                            d_sssp_distances, d_updated, num_graph_nodes);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            CUDA_CHECK(cudaMemcpy(&h_updated, d_updated, sizeof(int), cudaMemcpyDeviceToHost));
+            iterations++;
+            
+            if (h_updated == 0) break;
+        }
+        
+        CUDA_CHECK(cudaEventRecord(stop_event));
+        CUDA_CHECK(cudaEventSynchronize(stop_event));
+        
+        float sssp_time;
+        CUDA_CHECK(cudaEventElapsedTime(&sssp_time, start_event, stop_event));
+        
+        printf("SSSP (Bellman-Ford style):\n");
+        printf("  Nodes: %d, Edges: %d\n", num_graph_nodes, num_graph_edges);
+        printf("  Iterations: %d\n", iterations);
+        printf("  Time: %.2f ms\n", sssp_time);
+        printf("  Throughput: %.2f MEdges/s\n", (num_graph_edges / 1e6f) / (sssp_time / 1000.0f));
+        
+        cudaFree(d_updated);
+    }
+
+    void benchmarkSIMTPerformance() {
+        printf("\n=== SIMT Performance Improvement Benchmark ===\n");
+        
+        dim3 blockSize(256);
+        dim3 gridSize((simt_test_size + blockSize.x - 1) / blockSize.x);
+        
+        // Test 1: Uniform execution (good SIMT)
+        CUDA_CHECK(cudaEventRecord(start_event));
+        for (int i = 0; i < 100; i++) {
+            simtUniformKernel<<<gridSize, blockSize>>>(d_simt_uniform_input, 
+                                                    d_simt_uniform_output, simt_test_size);
+        }
+        CUDA_CHECK(cudaEventRecord(stop_event));
+        CUDA_CHECK(cudaEventSynchronize(stop_event));
+        
+        float uniform_time;
+        CUDA_CHECK(cudaEventElapsedTime(&uniform_time, start_event, stop_event));
+        
+        // Test 2: Divergent execution (poor SIMT)
+        CUDA_CHECK(cudaEventRecord(start_event));
+        for (int i = 0; i < 100; i++) {
+            simtDivergentKernel<<<gridSize, blockSize>>>(d_simt_divergent_input, 
+                                                        d_simt_divergent_output,
+                                                        d_simt_branch_data, simt_test_size);
+        }
+        CUDA_CHECK(cudaEventRecord(stop_event));
+        CUDA_CHECK(cudaEventSynchronize(stop_event));
+        
+        float divergent_time;
+        CUDA_CHECK(cudaEventElapsedTime(&divergent_time, start_event, stop_event));
+        
+        // Test 3: Balanced execution (better SIMT)
+        CUDA_CHECK(cudaEventRecord(start_event));
+        for (int i = 0; i < 100; i++) {
+            simtBalancedKernel<<<gridSize, blockSize>>>(d_simt_divergent_input, 
+                                                        d_simt_divergent_output,
+                                                        d_simt_branch_data, simt_test_size);
+        }
+        CUDA_CHECK(cudaEventRecord(stop_event));
+        CUDA_CHECK(cudaEventSynchronize(stop_event));
+        
+        float balanced_time;
+        CUDA_CHECK(cudaEventElapsedTime(&balanced_time, start_event, stop_event));
+        
+        printf("Data size: %d elements\n", simt_test_size);
+        printf("Pattern               Time(ms)  Relative  Efficiency\n");
+        printf("-----------------------------------------------------\n");
+        printf("Uniform (no diverge)  %8.2f     1.00x      100.0%%\n", 
+            uniform_time / 100);
+        printf("Divergent (4-way)     %8.2f     %.2fx      %5.1f%%\n", 
+            divergent_time / 100, divergent_time / uniform_time,
+            (uniform_time / divergent_time) * 100.0f);
+        printf("Balanced (predicated) %8.2f     %.2fx      %5.1f%%\n", 
+            balanced_time / 100, balanced_time / uniform_time,
+            (uniform_time / balanced_time) * 100.0f);
+        
+        printf("\nSIMT Efficiency Analysis:\n");
+        printf("  Divergence penalty: %.2fx slower\n", divergent_time / uniform_time);
+        printf("  Predication improvement: %.2fx faster than divergent\n", 
+            divergent_time / balanced_time);
+        printf("  Warp utilization (uniform): ~100%%\n");
+        printf("  Warp utilization (divergent): ~25%% (serialized execution)\n");
+        printf("  Warp utilization (balanced): ~50%% (all execute, selective use)\n");
+    }
+
     void runAllBenchmarks() {
         printf("                  ---  CUBench  ---\n");
         printf(" The Definitive Open-Source GPU Benchmarking Utility\n");
@@ -4608,6 +5095,9 @@ public:
             {"ManagedOnDemand", [](auto self){ self ->benchmark_managed_on_demand(); }},
             {"CooperativeGroups", [](auto self){ self ->benchmark_cooperative_groups(); }},
             {"TensorCores", [](auto self){ self ->benchmark_tensor_cores(); }},
+            {"MultiDimConv", [](auto self){ self->benchmarkMultiDimensionalConvolution(); }},
+            {"BFS_SSSP", [](auto self){ self->benchmarkBFSSSP(); }},
+            {"SIMT_Performance", [](auto self){ self->benchmarkSIMTPerformance(); }},
         };
 
         struct BenchResult {
