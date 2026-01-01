@@ -5007,200 +5007,237 @@ public:
         printf(" The Definitive Open-Source GPU Benchmarking Utility\n");
         printf(" ===================================================\n\n");
         
-        // Print a random funny message before benchmarks
-        const char* funny_messages[] = {
-            "Warning: GPU may become sentient during benchmarking.",
-            "If your GPU starts making toast, please contact support.",
-            "Benchmarking: Because your GPU needs a workout too.",
-            "Caution: Results may cause feelings of inadequacy in your CPU.",
-            "If you can read this, your GPU is faster than a potato.",
-            "Running benchmarks... Please do not feed the GPU.",
-            "Your GPU called. It wants more triangles.",
-            "This benchmark was brought to you by electrons.",
-            "GPU motto: 'I compute, therefore I am.'",
-            "If this crashes, blame cosmic rays.",
-            "Pro tip: You can get faster results if you cheer for your GPU.",
-            "Warning: May cause spontaneous pixelation. If this happens, consult your GPU's manufacturer. If you are a GPU manufacturer, hello!",
-            "Proof that AI frame gen is useless",
-            "GPU is currently busy flexing its FLOPS. give us a moment as we fix that...",
-            "If you see smoke, that's just the GPU working hard.",
-            "The one benchmarking software where a fire extinguisher is optional.",
-            "Remember: All benchmarks are fun until someone divides by zero.",
-            "It's all fun and games until this starts testing your CPU.",
-            "Completely Unorganised Benchmark software",
-            "If your fans get louder, it means it's working.",
-            "Sacrificing development sanity to the CUDA gods...",
-            "CUDA: Completely Unnecessary Driver Absurdity.",
-            "Programming is all fun and games until you somehow divide by a string."
-        };
-        int num_msgs = sizeof(funny_messages) / sizeof(funny_messages[0]);
-        srand((unsigned int)time(NULL));
-        int msg_idx = rand() % num_msgs;
-        printf(">>> %s\n\n", funny_messages[msg_idx]);
-
-        // Print GPU info
-        cudaDeviceProp prop;
-        CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-        printf("GPU: %s\n", prop.name);
-        printf("Compute Capability: %d.%d\n", prop.major, prop.minor);
-        printf("Global Memory: %.2f GB\n", prop.totalGlobalMem / (1024.0f * 1024.0f * 1024.0f));
-        printf("Multiprocessors: %d\n", prop.multiProcessorCount);
-        printf("Max Threads/Block: %d\n", prop.maxThreadsPerBlock);
-        printf("\n");
-        printf("Please wait as benchmarks are being performed. this may take a while...\n\n");
-
-        // List of benchmark lambdas and names
-        struct BenchCall { const char* name; std::function<void(RenderBenchmark*)> fn; };
-        std::vector<BenchCall> bench_calls = {
-            {"Rasterisation", [](auto self){ self->benchmarkRasterisation(); }},
-            {"Particles", [](auto self){ self->benchmarkParticles(); }},
-            {"RayTracing", [](auto self){ self->benchmarkRayTracing(); }},
-            {"TextureFiltering", [](auto self){ self->benchmarkTextureFiltering(); }},
-            {"ComputeShader", [](auto self){ self->benchmarkComputeShader(); }},
-            {"DeferredShading", [](auto self){ self->benchmarkDeferredShading(); }},
-            {"MatrixOperations", [](auto self){ self->benchmarkMatrixOperations(); }},
-            {"MemoryBandwidth", [](auto self){ self->benchmarkMemoryBandwidth(); }},
-            {"Tessellation", [](auto self){ self->benchmarkTessellation(); }},
-            {"Reduction", [](auto self){ self->reduction(); }},
-            {"PrefixSum", [](auto self){ self->prefixSum(); }},
-            {"Sort", [](auto self){ self->sortBench(); }},
-            {"SparseSpMV", [](auto self){ self->sparseSpMVBenchmark(); }},
-            {"FFTMul", [](auto self){ self->fftMultiply(); }},
-            {"AtomicOps", [](auto self){ self->benchmarkAtomicOperations(); }},
-            {"MemoryTypes", [](auto self){ self->benchmarkMemoryTypes(); }},
-            {"InitNewBenchData", [](auto self){ self->initializeNewBenchmarkData(); }},
-            {"InstrThroughput", [](auto self){ self->benchmarkInstructionThroughput(); }},
-            {"OccupancyWarpDiv", [](auto self){ self->benchmarkOccupancyAndWarpDivergence(); }},
-            {"GPUIdleContext", [](auto self){ self->benchmarkGPUIdleContextSwitchOverhead(); }},
-            {"ILPAnalysis", [](auto self){ self->benchmarkILPAnalysis(); }},
-            {"ThreadDivergence", [](auto self){ self->benchmarkThreadDivergence(); }},
-            {"DynamicParallelism", [](auto self){ self->benchmarkDynamicParallelism(); }},
-            {"FlatKernelEq", [](auto self){ self->benchmarkFlatKernelEquivalent(); }},
-            {"PersistentThreads", [](auto self){ self->benchmarkPersistentThreads(); }},
-            {"TextureCacheEff", [](auto self){ self->benchmarkTextureCacheEfficiency(); }},
-            {"RegisterPressure", [](auto self){ self->benchmarkRegisterPressureSpilling(); }},
-            {"MemoryLatency", [](auto self){ self->benchmarkMemoryLatency(); }},
-            {"PCIeBandwidth", [](auto self){ self->benchmarkPCIeBandwidth(); }},
-            {"P2PComm", [](auto self){ self->benchmarkP2PCommunication(); }},
-            {"AsyncExec", [](auto self){ self->benchmarkAsynchronousExecution(); }},
-            {"InstructionMix", [](auto self){ self->benchmarkInstructionMix(); }},
-            {"CacheThrashConf", [](auto self){ self->benchmarkCacheThrashingAndConflicts(); }},
-            {"BankConflictTest", [](auto self){ self->benchmarkBankConflictTesting(); }},
-            {"PersistentOccupancy", [](auto self){ self->benchmarkPersistentOccupancyVsContextSwitching(); }},
-            {"CUDAGraphOverhead", [](auto self){ self->benchmarkCUDAGraphExecutionOverhead(); }},
-            {"SMUtilisation", [](auto self){ self ->benchmarkSMUtilizationThermalThrottling(); }},
-            {"BVHEfficiency", [](auto self){ self ->benchmarkBVHTraversalEfficiency(); }},
-            {"MemoryAllocOverhead", [](auto self){ self ->benchmarkMemoryAllocationOverhead(); }},
-            {"OccupancyLimiting", [](auto self){ self ->benchmarkOccupancyLimitingFactors(); }},
-            {"ManagedOnDemand", [](auto self){ self ->benchmark_managed_on_demand(); }},
-            {"CooperativeGroups", [](auto self){ self ->benchmark_cooperative_groups(); }},
-            {"TensorCores", [](auto self){ self ->benchmark_tensor_cores(); }},
-            {"MultiDimConv", [](auto self){ self->benchmarkMultiDimensionalConvolution(); }},
-            {"BFS_SSSP", [](auto self){ self->benchmarkBFSSSP(); }},
-            {"SIMT_Performance", [](auto self){ self->benchmarkSIMTPerformance(); }},
-        };
-
-        struct BenchResult {
-            std::string name;
-            std::string output;
-        };
-        std::vector<BenchResult> results;
-
-        auto capture = [](auto fn, const char* name, RenderBenchmark* self) {
-            std::string out;
-            FILE* temp = tmpfile();
-            int temp_fd = fileno(temp);
-            int old_fd = dup(fileno(stdout));
-            fflush(stdout);
-            dup2(temp_fd, fileno(stdout));
-            fn(self);
-            fflush(stdout);
-            dup2(old_fd, fileno(stdout));
-            close(old_fd);
-            fseek(temp, 0, SEEK_SET);
-            char buf[4096];
-            while (fgets(buf, sizeof(buf), temp)) out += buf;
-            fclose(temp);
-            return BenchResult{name, out};
-        };
-
-        // Run and capture each benchmark
-        for (const auto& b : bench_calls) {
-            results.push_back(capture(b.fn, b.name, this));
+        // Detect number of GPUs
+        int deviceCount = 0;
+        CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+        
+        if (deviceCount == 0) {
+            printf("No CUDA-capable devices found!\n");
+            return;
         }
-
-        // Print results in columns, balancing by output length (lines) per column
-        printf("\n--- Benchmark Results ---\n\n");
-        const int num_cols = 4;
-        size_t num_bench = results.size();
-
-        // Count lines in each result
-        std::vector<size_t> bench_lines(num_bench, 0);
-        for (size_t i = 0; i < num_bench; ++i) {
-            size_t lines = 0;
-            std::istringstream iss(results[i].output);
-            std::string line;
-            while (std::getline(iss, line)) ++lines;
-            bench_lines[i] = lines;
-        }
-
-        // Greedy assignment: fill columns to balance total lines
-        std::vector<std::vector<size_t>> col_indices(num_cols);
-        std::vector<size_t> col_line_totals(num_cols, 0);
-        for (size_t i = 0; i < num_bench; ++i) {
-            // Find column with least total lines
-            size_t min_col = 0;
-            for (size_t c = 1; c < num_cols; ++c)
-            if (col_line_totals[c] < col_line_totals[min_col]) min_col = c;
-            col_indices[min_col].push_back(i);
-            col_line_totals[min_col] += bench_lines[i];
-        }
-
-        // Build columns: split output into lines, track max width
-        std::vector<std::vector<std::string>> columns(num_cols);
-        std::vector<size_t> col_widths(num_cols, 0);
-        for (int col = 0; col < num_cols; ++col) {
-            for (size_t idx : col_indices[col]) {
-            std::istringstream iss(results[idx].output);
-            std::string line;
-            while (std::getline(iss, line)) {
-                columns[col].push_back(line);
-                col_widths[col] = std::max(col_widths[col], line.size());
-            }
-            // Add a blank line between benchmarks
-            columns[col].push_back("");
-            }
-        }
-
-        // Find max lines per column
-        size_t max_lines = 0;
-        for (auto& col : columns)
-            max_lines = std::max(max_lines, col.size());
-
-        // Print each line of each column side by side
-        for (size_t line = 0; line < max_lines; ++line) {
-            for (size_t col = 0; col < num_cols; ++col) {
-            if (line < columns[col].size())
-                printf("%-*s  ", (int)col_widths[col], columns[col][line].c_str());
-            else
-                printf("%-*s  ", (int)col_widths[col], "");
-            }
+        
+        printf("Detected %d CUDA-capable device(s)\n\n", deviceCount);
+        
+        // Loop through each GPU
+        for (int deviceId = 0; deviceId < deviceCount; deviceId++) {
             printf("\n");
-        }
+            printf("========================================================\n");
+            printf("         BENCHMARKING GPU %d OF %d\n", deviceId + 1, deviceCount);
+            printf("========================================================\n\n");
+            
+            // Set current device
+            CUDA_CHECK(cudaSetDevice(deviceId));
+            
+            // Print a random funny message before benchmarks
+            const char* funny_messages[] = {
+                "Warning: GPU may become sentient during benchmarking.",
+                "If your GPU starts making toast, please contact support.",
+                "Benchmarking: Because your GPU needs a workout too.",
+                "Caution: Results may cause feelings of inadequacy in your CPU.",
+                "If you can read this, your GPU is faster than a potato.",
+                "Running benchmarks... Please do not feed the GPU.",
+                "Your GPU called. It wants more triangles.",
+                "This benchmark was brought to you by electrons.",
+                "GPU motto: 'I compute, therefore I am.'",
+                "If this crashes, blame cosmic rays.",
+                "Pro tip: You can get faster results if you cheer for your GPU.",
+                "Warning: May cause spontaneous pixelation. If this happens, consult your GPU's manufacturer. If you are a GPU manufacturer, hello!",
+                "Proof that AI frame gen is useless",
+                "GPU is currently busy flexing its FLOPS. give us a moment as we fix that...",
+                "If you see smoke, that's just the GPU working hard.",
+                "The one benchmarking software where a fire extinguisher is optional.",
+                "Remember: All benchmarks are fun until someone divides by zero.",
+                "It's all fun and games until this starts testing your CPU.",
+                "Completely Unorganised Benchmark software",
+                "If your fans get louder, it means it's working.",
+                "Sacrificing development sanity to the CUDA gods...",
+                "CUDA: Completely Unnecessary Driver Absurdity.",
+                "Programming is all fun and games until you somehow divide by a string."
+            };
+            int num_msgs = sizeof(funny_messages) / sizeof(funny_messages[0]);
+            srand((unsigned int)time(NULL) + deviceId); // Add deviceId for variation
+            int msg_idx = rand() % num_msgs;
+            printf(">>> %s\n\n", funny_messages[msg_idx]);
 
+            // Print GPU info
+            cudaDeviceProp prop;
+            CUDA_CHECK(cudaGetDeviceProperties(&prop, deviceId));
+            printf("Device ID: %d\n", deviceId);
+            printf("GPU: %s\n", prop.name);
+            printf("Compute Capability: %d.%d\n", prop.major, prop.minor);
+            printf("Global Memory: %.2f GB\n", prop.totalGlobalMem / (1024.0f * 1024.0f * 1024.0f));
+            printf("Multiprocessors: %d\n", prop.multiProcessorCount);
+            printf("Max Threads/Block: %d\n", prop.maxThreadsPerBlock);
+            printf("\n");
+            printf("Please wait as benchmarks are being performed. this may take a while...\n\n");
+
+            // Rest of the benchmark code remains the same (list of benchmark lambdas, capture function, etc.)
+            struct BenchCall { const char* name; std::function<void(RenderBenchmark*)> fn; };
+            std::vector<BenchCall> bench_calls = {
+                // ... (keep all the existing benchmark calls)
+                {"Rasterisation", [](auto self){ self->benchmarkRasterisation(); }},
+                {"Particles", [](auto self){ self->benchmarkParticles(); }},
+                {"RayTracing", [](auto self){ self->benchmarkRayTracing(); }},
+                {"TextureFiltering", [](auto self){ self->benchmarkTextureFiltering(); }},
+                {"ComputeShader", [](auto self){ self->benchmarkComputeShader(); }},
+                {"DeferredShading", [](auto self){ self->benchmarkDeferredShading(); }},
+                {"MatrixOperations", [](auto self){ self->benchmarkMatrixOperations(); }},
+                {"MemoryBandwidth", [](auto self){ self->benchmarkMemoryBandwidth(); }},
+                {"Tessellation", [](auto self){ self->benchmarkTessellation(); }},
+                {"Reduction", [](auto self){ self->reduction(); }},
+                {"PrefixSum", [](auto self){ self->prefixSum(); }},
+                {"Sort", [](auto self){ self->sortBench(); }},
+                {"SparseSpMV", [](auto self){ self->sparseSpMVBenchmark(); }},
+                {"FFTMul", [](auto self){ self->fftMultiply(); }},
+                {"AtomicOps", [](auto self){ self->benchmarkAtomicOperations(); }},
+                {"MemoryTypes", [](auto self){ self->benchmarkMemoryTypes(); }},
+                {"InitNewBenchData", [](auto self){ self->initializeNewBenchmarkData(); }},
+                {"InstrThroughput", [](auto self){ self->benchmarkInstructionThroughput(); }},
+                {"OccupancyWarpDiv", [](auto self){ self->benchmarkOccupancyAndWarpDivergence(); }},
+                {"GPUIdleContext", [](auto self){ self->benchmarkGPUIdleContextSwitchOverhead(); }},
+                {"ILPAnalysis", [](auto self){ self->benchmarkILPAnalysis(); }},
+                {"ThreadDivergence", [](auto self){ self->benchmarkThreadDivergence(); }},
+                {"DynamicParallelism", [](auto self){ self->benchmarkDynamicParallelism(); }},
+                {"FlatKernelEq", [](auto self){ self->benchmarkFlatKernelEquivalent(); }},
+                {"PersistentThreads", [](auto self){ self->benchmarkPersistentThreads(); }},
+                {"TextureCacheEff", [](auto self){ self->benchmarkTextureCacheEfficiency(); }},
+                {"RegisterPressure", [](auto self){ self->benchmarkRegisterPressureSpilling(); }},
+                {"MemoryLatency", [](auto self){ self->benchmarkMemoryLatency(); }},
+                {"PCIeBandwidth", [](auto self){ self->benchmarkPCIeBandwidth(); }},
+                {"P2PComm", [](auto self){ self->benchmarkP2PCommunication(); }},
+                {"AsyncExec", [](auto self){ self->benchmarkAsynchronousExecution(); }},
+                {"InstructionMix", [](auto self){ self->benchmarkInstructionMix(); }},
+                {"CacheThrashConf", [](auto self){ self->benchmarkCacheThrashingAndConflicts(); }},
+                {"BankConflictTest", [](auto self){ self->benchmarkBankConflictTesting(); }},
+                {"PersistentOccupancy", [](auto self){ self->benchmarkPersistentOccupancyVsContextSwitching(); }},
+                {"CUDAGraphOverhead", [](auto self){ self->benchmarkCUDAGraphExecutionOverhead(); }},
+                {"SMUtilisation", [](auto self){ self ->benchmarkSMUtilizationThermalThrottling(); }},
+                {"BVHEfficiency", [](auto self){ self ->benchmarkBVHTraversalEfficiency(); }},
+                {"MemoryAllocOverhead", [](auto self){ self ->benchmarkMemoryAllocationOverhead(); }},
+                {"OccupancyLimiting", [](auto self){ self ->benchmarkOccupancyLimitingFactors(); }},
+                {"ManagedOnDemand", [](auto self){ self ->benchmark_managed_on_demand(); }},
+                {"CooperativeGroups", [](auto self){ self ->benchmark_cooperative_groups(); }},
+                {"TensorCores", [](auto self){ self ->benchmark_tensor_cores(); }},
+                {"MultiDimConv", [](auto self){ self->benchmarkMultiDimensionalConvolution(); }},
+                {"BFS_SSSP", [](auto self){ self->benchmarkBFSSSP(); }},
+                {"SIMT_Performance", [](auto self){ self->benchmarkSIMTPerformance(); }},
+            };
+
+            struct BenchResult {
+                std::string name;
+                std::string output;
+            };
+            std::vector<BenchResult> results;
+
+            auto capture = [](auto fn, const char* name, RenderBenchmark* self) {
+                std::string out;
+                FILE* temp = tmpfile();
+                int temp_fd = fileno(temp);
+                int old_fd = dup(fileno(stdout));
+                fflush(stdout);
+                dup2(temp_fd, fileno(stdout));
+                fn(self);
+                fflush(stdout);
+                dup2(old_fd, fileno(stdout));
+                close(old_fd);
+                fseek(temp, 0, SEEK_SET);
+                char buf[4096];
+                while (fgets(buf, sizeof(buf), temp)) out += buf;
+                fclose(temp);
+                return BenchResult{name, out};
+            };
+
+            // Run and capture each benchmark
+            for (const auto& b : bench_calls) {
+                results.push_back(capture(b.fn, b.name, this));
+            }
+
+            // Print results in columns, balancing by output length (lines) per column
+            printf("\n--- Benchmark Results ---\n\n");
+            const int num_cols = 4;
+            size_t num_bench = results.size();
+
+            // Count lines in each result
+            std::vector<size_t> bench_lines(num_bench, 0);
+            for (size_t i = 0; i < num_bench; ++i) {
+                size_t lines = 0;
+                std::istringstream iss(results[i].output);
+                std::string line;
+                while (std::getline(iss, line)) ++lines;
+                bench_lines[i] = lines;
+            }
+
+            // Greedy assignment: fill columns to balance total lines
+            std::vector<std::vector<size_t>> col_indices(num_cols);
+            std::vector<size_t> col_line_totals(num_cols, 0);
+            for (size_t i = 0; i < num_bench; ++i) {
+                // Find column with least total lines
+                size_t min_col = 0;
+                for (size_t c = 1; c < num_cols; ++c)
+                if (col_line_totals[c] < col_line_totals[min_col]) min_col = c;
+                col_indices[min_col].push_back(i);
+                col_line_totals[min_col] += bench_lines[i];
+            }
+
+            // Build columns: split output into lines, track max width
+            std::vector<std::vector<std::string>> columns(num_cols);
+            std::vector<size_t> col_widths(num_cols, 0);
+            for (int col = 0; col < num_cols; ++col) {
+                for (size_t idx : col_indices[col]) {
+                std::istringstream iss(results[idx].output);
+                std::string line;
+                while (std::getline(iss, line)) {
+                    columns[col].push_back(line);
+                    col_widths[col] = std::max(col_widths[col], line.size());
+                }
+                // Add a blank line between benchmarks
+                columns[col].push_back("");
+                }
+            }
+
+            // Find max lines per column
+            size_t max_lines = 0;
+            for (auto& col : columns)
+                max_lines = std::max(max_lines, col.size());
+
+            // Print each line of each column side by side
+            for (size_t line = 0; line < max_lines; ++line) {
+                for (size_t col = 0; col < num_cols; ++col) {
+                if (line < columns[col].size())
+                    printf("%-*s  ", (int)col_widths[col], columns[col][line].c_str());
+                else
+                    printf("%-*s  ", (int)col_widths[col], "");
+                }
+                printf("\n");
+            }
+        } // End of device loop
+        
+        printf("\n\n");
+        printf("========================================================\n");
+        printf("   ALL GPU BENCHMARKS COMPLETED!\n");
+        printf("========================================================\n");
+        
         std::cout << "\nBenchmark completed! Press any key to quit." << std::endl;
         _getch();
     }
 };
 
 int main() {
-    // Initialize CUDA
-    CUDA_CHECK(cudaSetDevice(0));
-    
     // Configure benchmark
     BenchmarkConfig config;
     
-    // Run benchmark
+    // Detect all GPUs and create benchmark instances for each
+    int deviceCount = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    
+    if (deviceCount == 0) {
+        printf("No CUDA-capable devices found!\n");
+        return 1;
+    }
+    
+    // Note: We only create one benchmark instance and switch devices within runAllBenchmarks
+    // This avoids memory allocation issues with multiple instances
+    CUDA_CHECK(cudaSetDevice(0));
     RenderBenchmark benchmark(config);
     benchmark.runAllBenchmarks();
     
