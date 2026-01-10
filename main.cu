@@ -5056,7 +5056,6 @@ public:
                 "Benchmarking in progress: Please hold onto your hats (and your data).",
                 "Caution: Excessive benchmarking may lead to GPU enlightenment.",
                 "If your GPU starts humming, it's just happy to help.",
-                "Benchmarking: Because your GPU deserves a spa day too.",
                 "If your GPU starts speaking in binary, don't be alarmed.",
                 "This benchmark is powered by caffeine and sheer determination.",
                 "If your GPU starts glowing, it's just showing off its power.",
