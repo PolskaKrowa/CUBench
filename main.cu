@@ -5058,7 +5058,7 @@ public:
                 "If your GPU starts humming, it's just happy to help.",
                 "If your GPU starts speaking in binary, don't be alarmed.",
                 "This benchmark is powered by caffeine and sheer determination.",
-                "If your GPU starts glowing, it's just showing off its power.",
+                "If your GPU starts glowing, get better fans.",
             };
             int num_msgs = sizeof(funny_messages) / sizeof(funny_messages[0]);
             srand((unsigned int)time(NULL) + deviceId); // Add deviceId for variation
