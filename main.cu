@@ -5052,7 +5052,14 @@ public:
                 "If your fans get louder, it means it's working.",
                 "Sacrificing development sanity to the CUDA gods...",
                 "CUDA: Completely Unnecessary Driver Absurdity.",
-                "Programming is all fun and games until you somehow divide by a string."
+                "Programming is all fun and games until you somehow divide by a string.",
+                "Benchmarking in progress: Please hold onto your hats (and your data).",
+                "Caution: Excessive benchmarking may lead to GPU enlightenment.",
+                "If your GPU starts humming, it's just happy to help.",
+                "Benchmarking: Because your GPU deserves a spa day too.",
+                "If your GPU starts speaking in binary, don't be alarmed.",
+                "This benchmark is powered by caffeine and sheer determination.",
+                "If your GPU starts glowing, it's just showing off its power.",
             };
             int num_msgs = sizeof(funny_messages) / sizeof(funny_messages[0]);
             srand((unsigned int)time(NULL) + deviceId); // Add deviceId for variation
