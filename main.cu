@@ -1052,12 +1052,6 @@ private:
         double task_elapsed = current_ > 0
             ? std::chrono::duration<double>(now - task_start_).count() : 0.0;
 
-        double eta = 0;
-        if (completed_count_ > 0 && completed_count_ < total_) {
-            eta = (total_elapsed / completed_count_)
-                * (total_ - completed_count_);
-        }
-
         // --- Build the text portion (everything except the ASCII bar) ---
         std::string text;
         text += current_spinner_;
@@ -1074,15 +1068,11 @@ private:
             snprintf(buf, sizeof(buf), " | %.1fs", task_elapsed);
             text += buf;
         }
-        if (eta > 0 && current_ > 0) {
-            snprintf(buf, sizeof(buf), " | ETA: %.0fs", eta);
-            text += buf;
-        }
 
         std::string line;
         if (!use_sixel_) {
             // Insert an ASCII bar between the spinner and the text info.
-            // Layout: <spinner> [<bar>] <percent> [task] [timing] [eta]
+            // Layout: <spinner> [<bar>] <percent> [task] [timing]
             // Bar width is calculated to fill exactly the remaining space.
             std::string prefix = current_spinner_;
             prefix += " [";
@@ -1096,10 +1086,6 @@ private:
             }
             if (task_elapsed > 0) {
                 snprintf(buf, sizeof(buf), " | %.1fs", task_elapsed);
-                suffix += buf;
-            }
-            if (eta > 0 && current_ > 0) {
-                snprintf(buf, sizeof(buf), " | ETA: %.0fs", eta);
                 suffix += buf;
             }
 
@@ -8097,7 +8083,8 @@ public:
         printf("   ALL GPU BENCHMARKS COMPLETED!\n");
         printf("========================================================\n");
         
-        std::cout << "\nBenchmark completed! Press any key to quit." << std::endl;
+        std::cout << "\nBenchmark completed! Press any key to quit.\n" << 
+        "You may need to zoom out your terminal to view all 3 result columns" << std::endl;
         _getch();
     }
 };
