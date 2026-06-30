@@ -1052,6 +1052,12 @@ private:
         double task_elapsed = current_ > 0
             ? std::chrono::duration<double>(now - task_start_).count() : 0.0;
 
+        double eta = 0;
+        if (completed_count_ > 0 && completed_count_ < total_) {
+            eta = (total_elapsed / completed_count_)
+                * (total_ - completed_count_);
+        }
+
         // --- Build the text portion (everything except the ASCII bar) ---
         std::string text;
         text += current_spinner_;
@@ -1068,11 +1074,15 @@ private:
             snprintf(buf, sizeof(buf), " | %.1fs", task_elapsed);
             text += buf;
         }
+        if (eta > 0 && current_ > 0) {
+            snprintf(buf, sizeof(buf), " | ETA: %.0fs", eta);
+            text += buf;
+        }
 
         std::string line;
         if (!use_sixel_) {
             // Insert an ASCII bar between the spinner and the text info.
-            // Layout: <spinner> [<bar>] <percent> [task] [timing]
+            // Layout: <spinner> [<bar>] <percent> [task] [timing] [eta]
             // Bar width is calculated to fill exactly the remaining space.
             std::string prefix = current_spinner_;
             prefix += " [";
@@ -1086,6 +1096,10 @@ private:
             }
             if (task_elapsed > 0) {
                 snprintf(buf, sizeof(buf), " | %.1fs", task_elapsed);
+                suffix += buf;
+            }
+            if (eta > 0 && current_ > 0) {
+                snprintf(buf, sizeof(buf), " | ETA: %.0fs", eta);
                 suffix += buf;
             }
 
@@ -1310,6 +1324,13 @@ struct BenchmarkConfig {
     int softmax_head_dim      = 64;     // D — head dimension (must match FA_D)
     int softmax_batch_heads   = 1024;   // M — total rows (batch * num_heads)
     int softmax_iters         = 50;     // iterations per timed region
+    // Buffers are sized for the largest N in the sweep so we can reuse them
+    // across all sweep points without reallocating.  Set this to the maximum
+    // seq_len you intend to benchmark.
+    int softmax_max_seq_len   = 4096;
+    // Duration (ms) for the power-efficiency measurement of flash attention.
+    int softmax_power_duration_ms = 1500;
+    int softmax_power_sample_ms   = 50;
 };
 
 // Vertex structure
@@ -3238,6 +3259,171 @@ __global__ void flash_attention_kernel(const float* __restrict__ Q,  // [M, D]
 #undef FA_BC
 #undef FA_D
 
+// ============================================================================
+// FP16 softmax kernel — same online algorithm as softmax_online_kernel but
+// with __half inputs/outputs.  Math is still FP32 (standard "FP16 with FP32
+// accumulate" pattern); the win is halved HBM traffic, which is the main
+// bottleneck for memory-bound softmax.
+// ============================================================================
+__global__ void softmax_online_fp16_kernel(const __half* __restrict__ input,
+                                           __half* __restrict__ output,
+                                           int row_length) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    const __half* in_row  = input  + (size_t)row * row_length;
+    __half*       out_row = output + (size_t)row * row_length;
+
+    // Phase 1: per-thread running (m, l), math in FP32
+    float m_local = -INFINITY;
+    float l_local = 0.0f;
+    for (int i = tid; i < row_length; i += 32) {
+        float x = __half2float(in_row[i]);
+        float m_new = fmaxf(m_local, x);
+        l_local = l_local * expf(m_local - m_new) + expf(x - m_new);
+        m_local = m_new;
+    }
+
+    // Warp reduce
+    for (int off = 16; off > 0; off >>= 1) {
+        float m_other = __shfl_xor_sync(0xffffffff, m_local, off);
+        float l_other = __shfl_xor_sync(0xffffffff, l_local, off);
+        float m_new = fmaxf(m_local, m_other);
+        l_local = l_local * expf(m_local - m_new) + l_other * expf(m_other - m_new);
+        m_local = m_new;
+    }
+    float row_max = m_local;
+    float inv_sum = 1.0f / l_local;
+
+    // Phase 2: write normalized output (convert back to __half)
+    for (int i = tid; i < row_length; i += 32) {
+        float x = __half2float(in_row[i]);
+        out_row[i] = __float2half(expf(x - row_max) * inv_sum);
+    }
+}
+
+// ============================================================================
+// FP16 Flash attention — __half inputs/outputs and __half shared-memory tiles
+// for K and V (halving the smem footprint for those tiles).  Math (dot product,
+// online softmax, PV accumulation) is still FP32 for numerical stability.
+//
+// This is the "FP16 with FP32 accumulate" pattern that cuDNN exposes — the
+// bandwidth win comes from halved HBM traffic for Q/K/V/O and halved smem
+// for the K/V tiles, which lets us fit larger tiles in the same shared
+// memory budget.
+// ============================================================================
+#define FA_BR 16
+#define FA_BC 64
+#define FA_D  64
+
+__global__ void flash_attention_fp16_kernel(const __half* __restrict__ Q,
+                                            const __half* __restrict__ K,
+                                            const __half* __restrict__ V,
+                                            __half* __restrict__ O,
+                                            int M, int N, float scale) {
+    constexpr int Br = FA_BR;
+    constexpr int Bc = FA_BC;
+    constexpr int D  = FA_D;
+
+    int q_row_start = blockIdx.x * Br;
+
+    // Mixed-type shared memory: sK, sV are __half (tile loads); sS, sO, sM, sL
+    // are float (accumulator / softmax state).  We carve the dynamic smem
+    // region into typed sub-arrays via a raw byte pointer.
+    extern __shared__ unsigned char smem_raw[];
+    __half* sK = reinterpret_cast<__half*>(smem_raw);
+    __half* sV = sK + (size_t)Bc * D;
+    float*  sS = reinterpret_cast<float*>(sV + (size_t)Bc * D);
+    float*  sO = sS + (size_t)Br * Bc;
+    float*  sM = sO + (size_t)Br * D;
+    float*  sL = sM + Br;
+
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+
+    // Init per-row running state
+    for (int r = tid; r < Br; r += nt) {
+        sM[r] = -INFINITY;
+        sL[r] = 0.0f;
+        for (int d = 0; d < D; d++) sO[r * D + d] = 0.0f;
+    }
+    __syncthreads();
+
+    int valid_Br = std::min(Br, M - q_row_start);
+    if (valid_Br <= 0) return;
+
+    for (int kv_start = 0; kv_start < N; kv_start += Bc) {
+        int actual_Bc = std::min(Bc, N - kv_start);
+
+        // --- Load K, V tiles into shared memory (half precision) ---
+        for (int i = tid; i < actual_Bc * D; i += nt) {
+            int lr = i / D;
+            int lc = i % D;
+            sK[lr * D + lc] = K[(size_t)(kv_start + lr) * D + lc];
+            sV[lr * D + lc] = V[(size_t)(kv_start + lr) * D + lc];
+        }
+        __syncthreads();
+
+        // --- Compute scores sS[r, c] = scale * sum_d Q[r,d] * K[c,d] ---
+        // Q is read directly from global memory as __half and converted to
+        // float for the dot product.  This is the bandwidth-critical path:
+        // each Q element is read N/Bc times across the kernel, but only 2
+        // bytes per element instead of 4.
+        for (int idx = tid; idx < valid_Br * actual_Bc; idx += nt) {
+            int r = idx / actual_Bc;
+            int c = idx % actual_Bc;
+            int qrow = q_row_start + r;
+            float dot = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < D; d++) {
+                float q_val = __half2float(Q[(size_t)qrow * D + d]);
+                float k_val = __half2float(sK[c * D + d]);
+                dot += q_val * k_val;
+            }
+            sS[r * Bc + c] = dot * scale;
+        }
+        __syncthreads();
+
+        // --- Online softmax update per row (FP32 math) ---
+        for (int r = tid; r < valid_Br; r += nt) {
+            float m_old = sM[r];
+            float m_new = m_old;
+            for (int c = 0; c < actual_Bc; c++) {
+                m_new = fmaxf(m_new, sS[r * Bc + c]);
+            }
+            float rescale = expf(m_old - m_new);
+            #pragma unroll
+            for (int d = 0; d < D; d++) sO[r * D + d] *= rescale;
+            float l_new = sL[r] * rescale;
+            for (int c = 0; c < actual_Bc; c++) {
+                float p = expf(sS[r * Bc + c] - m_new);
+                l_new += p;
+                #pragma unroll
+                for (int d = 0; d < D; d++) {
+                    float v_val = __half2float(sV[c * D + d]);
+                    sO[r * D + d] += p * v_val;
+                }
+            }
+            sM[r] = m_new;
+            sL[r] = l_new;
+        }
+        __syncthreads();
+    }
+
+    // --- Final: O = O / l, convert to __half ---
+    for (int r = tid; r < valid_Br; r += nt) {
+        float inv_l = 1.0f / sL[r];
+        #pragma unroll
+        for (int d = 0; d < D; d++) {
+            O[(size_t)(q_row_start + r) * D + d] =
+                __float2half(sO[r * D + d] * inv_l);
+        }
+    }
+}
+
+#undef FA_BR
+#undef FA_BC
+#undef FA_D
+
 class RenderBenchmark {
 private:
     BenchmarkConfig config;
@@ -3445,6 +3631,14 @@ private:
     float* d_attn_S;            // [M, N] materialized score matrix (naive only)
     float* d_attn_O_naive;      // [M, D] naive attention output
     float* d_attn_O_flash;      // [M, D] flash attention output
+
+    // FP16 counterparts for the FP16 path (half the HBM bandwidth)
+    __half* d_softmax_input_h;   // [M, N]
+    __half* d_softmax_output_h;  // [M, N]
+    __half* d_attn_Q_h;          // [M, D]
+    __half* d_attn_K_h;          // [N, D]
+    __half* d_attn_V_h;          // [N, D]
+    __half* d_attn_O_flash_h;    // [M, D]
 
 public:
     RenderBenchmark(const BenchmarkConfig& cfg) : config(cfg) {
@@ -3700,13 +3894,14 @@ public:
                 config.softmax_head_dim, config.softmax_head_dim);
         }
 
-        // Use the same M, N, D across all softmax/attention kernels so the
-        // numbers are directly comparable.  N for the softmax microbenchmark
-        // is the sequence length; M is the number of rows.
+        // Buffers are sized for the LARGEST seq_len we intend to benchmark
+        // (config.softmax_max_seq_len) so the sweep can reuse them at every
+        // N without reallocating.  M and D are fixed across the sweep.
         const int sm_M = config.softmax_batch_heads;
-        const int sm_N = config.softmax_seq_len;
+        const int sm_N = config.softmax_max_seq_len;   // sized for sweep
         const int sm_D = config.softmax_head_dim;
 
+        // FP32 allocations
         CUDA_CHECK(cudaMalloc(&d_softmax_input,  (size_t)sm_M * sm_N * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_softmax_output, (size_t)sm_M * sm_N * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_attn_Q,         (size_t)sm_M * sm_D * sizeof(float)));
@@ -3715,6 +3910,14 @@ public:
         CUDA_CHECK(cudaMalloc(&d_attn_S,         (size_t)sm_M * sm_N * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_attn_O_naive,   (size_t)sm_M * sm_D * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_attn_O_flash,   (size_t)sm_M * sm_D * sizeof(float)));
+
+        // FP16 allocations (half the bytes)
+        CUDA_CHECK(cudaMalloc(&d_softmax_input_h,  (size_t)sm_M * sm_N * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&d_softmax_output_h, (size_t)sm_M * sm_N * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&d_attn_Q_h,         (size_t)sm_M * sm_D * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&d_attn_K_h,         (size_t)sm_N * sm_D * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&d_attn_V_h,         (size_t)sm_N * sm_D * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&d_attn_O_flash_h,   (size_t)sm_M * sm_D * sizeof(__half)));
 
         // Fill softmax input and Q/K/V with small random values.  Using a
         // narrow range keeps expf() well-behaved (no overflow / underflow)
@@ -3736,6 +3939,31 @@ public:
                               cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_attn_V, h_kv.data(),
                               (size_t)sm_N * sm_D * sizeof(float),
+                              cudaMemcpyHostToDevice));
+
+        // Build FP16 counterparts by converting the FP32 init data.  The
+        // values are well within FP16 range (max |x| ~ 2), so the cast is
+        // lossless for our purposes.
+        std::vector<__half> h_sm_input_h((size_t)sm_M * sm_N);
+        std::vector<__half> h_qkv_h((size_t)sm_M * sm_D);
+        std::vector<__half> h_kv_h((size_t)sm_N * sm_D);
+        for (size_t i = 0; i < h_sm_input.size(); i++)
+            h_sm_input_h[i] = __float2half(h_sm_input[i]);
+        for (size_t i = 0; i < h_qkv.size(); i++)
+            h_qkv_h[i] = __float2half(h_qkv[i]);
+        for (size_t i = 0; i < h_kv.size(); i++)
+            h_kv_h[i] = __float2half(h_kv[i]);
+        CUDA_CHECK(cudaMemcpy(d_softmax_input_h, h_sm_input_h.data(),
+                              (size_t)sm_M * sm_N * sizeof(__half),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_attn_Q_h, h_qkv_h.data(),
+                              (size_t)sm_M * sm_D * sizeof(__half),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_attn_K_h, h_kv_h.data(),
+                              (size_t)sm_N * sm_D * sizeof(__half),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_attn_V_h, h_kv_h.data(),
+                              (size_t)sm_N * sm_D * sizeof(__half),
                               cudaMemcpyHostToDevice));
     }
     
@@ -3885,6 +4113,14 @@ public:
         cudaFree(d_attn_S);
         cudaFree(d_attn_O_naive);
         cudaFree(d_attn_O_flash);
+
+        // FP16 frees
+        cudaFree(d_softmax_input_h);
+        cudaFree(d_softmax_output_h);
+        cudaFree(d_attn_Q_h);
+        cudaFree(d_attn_K_h);
+        cudaFree(d_attn_V_h);
+        cudaFree(d_attn_O_flash_h);
     }
 
     void initializeLights() {
@@ -6574,41 +6810,51 @@ public:
     // ========================================================================
     // Softmax + Flash-Attention benchmark
     // ------------------------------------------------------------------------
-    // Two parts:
-    //   1. Softmax microbenchmark: naive 3-pass vs. online 1-pass over the
-    //      same [M, N] input.  Reports time and effective HBM bandwidth.
+    // Three parts:
+    //   1. Softmax microbenchmark: naive 3-pass (FP32), online 1-pass (FP32),
+    //      and online 1-pass (FP16).  Shows the algorithmic win of online
+    //      softmax and the bandwidth win of FP16 storage.
     //
-    //   2. Attention benchmark: naive attention (3 launches, materialises
-    //      the full M×N score matrix) vs. flash attention (tiled, online
-    //      softmax, single kernel, no score matrix in HBM).  Reports time,
-    //      GFLOPS, and the max-abs-diff between the two implementations to
-    //      confirm they agree numerically.
+    //   2. Attention sweep over seq_len ∈ {512, 1024, 2048, 4096}:
+    //      naive attention (3 launches, materialises S+P) vs. flash attention
+    //      (FP32) vs. flash attention (FP16).  Shows how flash's advantage
+    //      grows with N (the size of the materialised score matrix).
+    //
+    //   3. Power efficiency of flash attention: runs the FP32 flash kernel
+    //      for ~1.5 s with the GpuMetricSampler active and reports GFLOPS/W,
+    //      sustained SM clock, throttle reasons, etc.
     // ========================================================================
     void benchmarkSoftmaxFlashAttention() {
         printf("\n=== Softmax + Flash-Attention Benchmark ===\n");
 
-        const int M     = config.softmax_batch_heads;   // rows (batch * heads)
-        const int N     = config.softmax_seq_len;        // row length / seq len
-        const int D     = config.softmax_head_dim;       // head dim
+        const int M       = config.softmax_batch_heads;   // rows (batch * heads)
+        const int D       = config.softmax_head_dim;       // head dim
         const float scale = 1.0f / sqrtf((float)D);
-        const int iters = config.softmax_iters;
+        const int iters   = config.softmax_iters;
+
+        // Sweep seq_len over a representative range.  Buffers in the ctor are
+        // sized for softmax_max_seq_len, so any subset of these is safe.
+        static const int sweep_sizes[] = {512, 1024, 2048, 4096};
+        const int num_sweep = (int)(sizeof(sweep_sizes) / sizeof(sweep_sizes[0]));
 
         printf("Configuration:\n");
         printf("  M (batch*heads): %d\n", M);
-        printf("  N (seq_len):     %d\n", N);
         printf("  D (head_dim):    %d\n", D);
         printf("  Scale:           %.4f\n", scale);
-        printf("  Iterations:      %d\n\n", iters);
+        printf("  Iterations:      %d\n", iters);
+        printf("  Sweep sizes N:   ");
+        for (int i = 0; i < num_sweep; i++) printf("%d ", sweep_sizes[i]);
+        printf("(max buffer N=%d)\n\n", config.softmax_max_seq_len);
 
-        // ------------------------------------------------------------------
-        // Part 1: softmax microbenchmark
-        // ------------------------------------------------------------------
-        printf("--- Softmax comparison (M=%d rows, N=%d cols) ---\n", M, N);
+        // ==================================================================
+        // Part 1: softmax microbenchmark (FP32 naive, FP32 online, FP16 online)
+        // ==================================================================
+        const int micro_N = config.softmax_seq_len;
+        printf("--- Softmax comparison (M=%d rows, N=%d cols) ---\n", M, micro_N);
 
-        // Helper lambda: time `iters` launches of a softmax kernel.
-        auto time_softmax = [&](void (*kernel)(const float*, float*, int),
-                                const char* tag) {
-            // warmup
+        // Time `iters` launches of an FP32 softmax kernel.
+        auto time_softmax_fp32 = [&](void (*kernel)(const float*, float*, int),
+                                     const char* tag, int N) {
             kernel<<<M, 32>>>(d_softmax_input, d_softmax_output, N);
             CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -6621,53 +6867,101 @@ public:
             float ms = 0;
             CUDA_CHECK(cudaEventElapsedTime(&ms, start_event, stop_event));
 
-            // Bytes touched: 1 read + 1 write of M*N floats
             size_t bytes = 2ULL * M * N * sizeof(float);
             double gbs = (bytes * iters) / (ms * 1e6);
-            printf("  %-16s %7.3f ms/iter   %7.2f GB/s\n",
+            printf("  %-26s %7.3f ms/iter   %7.2f GB/s\n",
                    tag, ms / iters, gbs);
             return ms / iters;
         };
 
-        float ms_naive  = time_softmax(softmax_naive_kernel,  "Naive 3-pass:");
-        float ms_online = time_softmax(softmax_online_kernel, "Online 1-pass:");
-        printf("  Speedup:         %.2fx  (online vs naive)\n", ms_naive / ms_online);
+        // Time `iters` launches of the FP16 softmax kernel.
+        auto time_softmax_fp16 = [&](void (*kernel)(const __half*, __half*, int),
+                                     const char* tag, int N) {
+            kernel<<<M, 32>>>(d_softmax_input_h, d_softmax_output_h, N);
+            CUDA_CHECK(cudaDeviceSynchronize());
 
-        // ------------------------------------------------------------------
-        // Part 2: attention benchmark
-        // ------------------------------------------------------------------
-        printf("\n--- Attention comparison (M=N=%d, D=%d) ---\n", N, D);
+            CUDA_CHECK(cudaEventRecord(start_event));
+            for (int i = 0; i < iters; i++) {
+                kernel<<<M, 32>>>(d_softmax_input_h, d_softmax_output_h, N);
+            }
+            CUDA_CHECK(cudaEventRecord(stop_event));
+            CUDA_CHECK(cudaEventSynchronize(stop_event));
+            float ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, start_event, stop_event));
 
-        // Memory accounting: naive attention materialises S and (in-place) P,
-        // each M*N floats.  Flash attention only touches Q, K, V, O plus
-        // shared-memory tiles.
-        size_t qkv_bytes   = 3ULL * M * D * sizeof(float) + M * D * sizeof(float);
-        size_t naive_extra = 2ULL * M * N * sizeof(float);
-        size_t flash_extra = 0;
-        printf("  QKV+O size:      %.2f MB\n", qkv_bytes   / (1024.0 * 1024.0));
-        printf("  Naive extra HBM: %.2f MB (S + P matrices)\n",
-               naive_extra / (1024.0 * 1024.0));
-        printf("  Flash extra HBM: %.2f MB (only shared-mem tiles)\n",
-               flash_extra / (1024.0 * 1024.0));
+            // FP16: 2 bytes per element instead of 4
+            size_t bytes = 2ULL * M * N * sizeof(__half);
+            double gbs = (bytes * iters) / (ms * 1e6);
+            printf("  %-26s %7.3f ms/iter   %7.2f GB/s\n",
+                   tag, ms / iters, gbs);
+            return ms / iters;
+        };
 
-        // FLOP accounting (per iteration):
-        //   QK^T:    2*M*N*D     (mul+add per output element)
-        //   softmax: ~3*M*N      (max, exp, div — counted approximately)
-        //   PV:      2*M*N*D
-        //   Total ≈ 4*M*N*D  (softmax term is small for D=64)
-        double flops_per_iter = 4.0 * (double)M * (double)N * (double)D;
+        float sm_naive  = time_softmax_fp32(softmax_naive_kernel,
+                                            "Naive 3-pass (FP32):", micro_N);
+        float sm_online = time_softmax_fp32(softmax_online_kernel,
+                                            "Online 1-pass (FP32):", micro_N);
+        float sm_online_h = time_softmax_fp16(softmax_online_fp16_kernel,
+                                              "Online 1-pass (FP16):", micro_N);
+        printf("  Speedup online vs naive: %.2fx\n", sm_naive / sm_online);
+        printf("  Speedup FP16 vs FP32:    %.2fx (bandwidth-driven)\n",
+               sm_online / sm_online_h);
 
-        // ----- Naive attention: 3 launches -----
-        {
+        // ==================================================================
+        // Part 2: attention sweep over seq_len
+        // ==================================================================
+        printf("\n--- Attention sweep (M=%d, D=%d) ---\n", M, D);
+        printf("  Each row: time per iter (ms) and GFLOPS for naive FP32,\n");
+        printf("  flash FP32, and flash FP16.  Speedup is naive vs flash FP32.\n");
+        printf("  %-6s | %10s %10s %10s | %10s %10s %10s | %8s\n",
+               "N", "Naive ms", "Flash ms", "FlashH ms",
+               "Naive GF", "Flash GF", "FlashH GF", "Speedup");
+        printf("  %s\n",
+               "-------+------------+------------+------------+"
+               "------------+------------+------------+----------");
+
+        constexpr int Br = 16;
+        constexpr int Bc = 64;
+        constexpr int Dc = 64;  // must match FA_D / config.softmax_head_dim
+        const int blocks  = (M + Br - 1) / Br;
+        const int threads = 128;
+
+        // FP32 flash smem: sK+sV+sS+sO+sM+sL all float
+        size_t smem_fp32 = (size_t)(Bc * Dc + Bc * Dc + Br * Bc + Br * Dc + 2 * Br)
+                           * sizeof(float);
+        // FP16 flash smem: sK+sV are __half; sS+sO+sM+sL are float
+        size_t smem_fp16 = (size_t)(Bc * Dc + Bc * Dc) * sizeof(__half)
+                         + (size_t)(Br * Bc + Br * Dc + 2 * Br) * sizeof(float);
+
+        // Opt-in to large dynamic smem on Ampere+ (no-op if it fits in 48 KB).
+        cudaDeviceProp prop;
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+        if (smem_fp32 > 48 * 1024) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                (const void*)flash_attention_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_fp32));
+        }
+        if (smem_fp16 > 48 * 1024) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                (const void*)flash_attention_fp16_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_fp16));
+        }
+
+        for (int si = 0; si < num_sweep; si++) {
+            const int N = sweep_sizes[si];
+            // FLOPs per attention iter ≈ 4 * M * N * D
+            //   (QK^T: 2*M*N*D, PV: 2*M*N*D, softmax ~3*M*N negligible for D=64)
+            double flops_per_iter = 4.0 * (double)M * (double)N * (double)D;
+
+            // ----- Naive attention (3 launches) -----
             dim3 block_qk(64);
             dim3 grid_qk((N + block_qk.x - 1) / block_qk.x, M);
             dim3 block_pv(64);
             dim3 grid_pv((D + block_pv.x - 1) / block_pv.x, M);
 
-            // warmup
             attention_qk_kernel<<<grid_qk, block_qk>>>(
                 d_attn_Q, d_attn_K, d_attn_S, M, N, D, scale);
-            softmax_naive_kernel<<<M, 32>>>(d_attn_S, d_attn_S, N);  // in-place
+            softmax_naive_kernel<<<M, 32>>>(d_attn_S, d_attn_S, N);
             attention_pv_kernel<<<grid_pv, block_pv>>>(
                 d_attn_S, d_attn_V, d_attn_O_naive, M, N, D);
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -6682,67 +6976,74 @@ public:
             }
             CUDA_CHECK(cudaEventRecord(stop_event));
             CUDA_CHECK(cudaEventSynchronize(stop_event));
-            float ms = 0;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, start_event, stop_event));
+            float ms_naive = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms_naive, start_event, stop_event));
+            double gflops_naive = (flops_per_iter * iters) / (ms_naive * 1e6);
 
-            double gflops = (flops_per_iter * iters) / (ms * 1e6);
-            printf("\n  Naive attention (3 launches, materialises S+P):\n");
-            printf("    Time:     %7.3f ms/iter\n", ms / iters);
-            printf("    Perf:     %7.2f GFLOPS\n", gflops);
-        }
-
-        // ----- Flash attention (tiled, single kernel) -----
-        constexpr int Br = 16;
-        constexpr int Bc = 64;
-        constexpr int Dc = 64;  // must match FA_D / config.softmax_head_dim
-        const int blocks  = (M + Br - 1) / Br;
-        const int threads = 128;
-
-        // Shared memory layout (bytes):
-        //   sK [Bc*D] + sV [Bc*D] + sS [Br*Bc] + sO [Br*D] + sM [Br] + sL [Br]
-        size_t smem_bytes = (size_t)(Bc * Dc + Bc * Dc + Br * Bc + Br * Dc + 2 * Br)
-                             * sizeof(float);
-
-        // Allow the kernel to use up to 96 KB of dynamic shared memory on
-        // devices that support it (Ampere+).  The 48 KB default is enough
-        // for our tile sizes, but this guards against future enlargements.
-        cudaDeviceProp prop;
-        CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-        if (smem_bytes > prop.sharedMemPerBlock) {
-            printf("\n  Flash attention: shared-memory requirement (%zu B) exceeds "
-                   "device default (%zu B).  Skipping.\n",
-                   smem_bytes, (size_t)prop.sharedMemPerBlock);
-        } else {
-            if (smem_bytes > 48 * 1024) {
-                CUDA_CHECK(cudaFuncSetAttribute(
-                    (const void*)flash_attention_kernel,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    (int)smem_bytes));
-            }
-
-            // warmup
-            flash_attention_kernel<<<blocks, threads, smem_bytes>>>(
+            // ----- Flash attention FP32 -----
+            flash_attention_kernel<<<blocks, threads, smem_fp32>>>(
                 d_attn_Q, d_attn_K, d_attn_V, d_attn_O_flash, M, N, scale);
             CUDA_CHECK(cudaDeviceSynchronize());
 
             CUDA_CHECK(cudaEventRecord(start_event));
             for (int i = 0; i < iters; i++) {
-                flash_attention_kernel<<<blocks, threads, smem_bytes>>>(
+                flash_attention_kernel<<<blocks, threads, smem_fp32>>>(
                     d_attn_Q, d_attn_K, d_attn_V, d_attn_O_flash, M, N, scale);
             }
             CUDA_CHECK(cudaEventRecord(stop_event));
             CUDA_CHECK(cudaEventSynchronize(stop_event));
-            float ms = 0;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, start_event, stop_event));
+            float ms_flash = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms_flash, start_event, stop_event));
+            double gflops_flash = (flops_per_iter * iters) / (ms_flash * 1e6);
 
-            double gflops = (flops_per_iter * iters) / (ms * 1e6);
-            printf("\n  Flash attention (tiled, online softmax):\n");
-            printf("    Time:     %7.3f ms/iter\n", ms / iters);
-            printf("    Perf:     %7.2f GFLOPS\n", gflops);
-            printf("    Tile:     Br=%d Bc=%d D=%d  threads=%d  smem=%.1f KB\n",
-                   Br, Bc, Dc, threads, smem_bytes / 1024.0);
+            // ----- Flash attention FP16 -----
+            flash_attention_fp16_kernel<<<blocks, threads, smem_fp16>>>(
+                d_attn_Q_h, d_attn_K_h, d_attn_V_h, d_attn_O_flash_h,
+                M, N, scale);
+            CUDA_CHECK(cudaDeviceSynchronize());
 
-            // ----- Correctness check: naive vs flash -----
+            CUDA_CHECK(cudaEventRecord(start_event));
+            for (int i = 0; i < iters; i++) {
+                flash_attention_fp16_kernel<<<blocks, threads, smem_fp16>>>(
+                    d_attn_Q_h, d_attn_K_h, d_attn_V_h, d_attn_O_flash_h,
+                    M, N, scale);
+            }
+            CUDA_CHECK(cudaEventRecord(stop_event));
+            CUDA_CHECK(cudaEventSynchronize(stop_event));
+            float ms_flash_h = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms_flash_h, start_event, stop_event));
+            double gflops_flash_h = (flops_per_iter * iters) / (ms_flash_h * 1e6);
+
+            printf("  %-6d | %10.3f %10.3f %10.3f | %10.1f %10.1f %10.1f | %7.2fx\n",
+                   N,
+                   ms_naive / iters, ms_flash / iters, ms_flash_h / iters,
+                   gflops_naive, gflops_flash, gflops_flash_h,
+                   ms_naive / ms_flash);
+        }
+
+        // Sweep summary: how flash's advantage scales with N
+        printf("\n  Sweep insight: as N grows, naive attention must materialise\n");
+        printf("  and re-read an N×N score matrix in HBM, while flash attention\n");
+        printf("  keeps everything in shared memory.  Expect the speedup column\n");
+        printf("  to grow roughly linearly with N.\n");
+
+        // ----- Correctness check at default N -----
+        const int N_default = config.softmax_seq_len;
+        {
+            dim3 block_qk(64);
+            dim3 grid_qk((N_default + block_qk.x - 1) / block_qk.x, M);
+            dim3 block_pv(64);
+            dim3 grid_pv((D + block_pv.x - 1) / block_pv.x, M);
+
+            attention_qk_kernel<<<grid_qk, block_qk>>>(
+                d_attn_Q, d_attn_K, d_attn_S, M, N_default, D, scale);
+            softmax_naive_kernel<<<M, 32>>>(d_attn_S, d_attn_S, N_default);
+            attention_pv_kernel<<<grid_pv, block_pv>>>(
+                d_attn_S, d_attn_V, d_attn_O_naive, M, N_default, D);
+            flash_attention_kernel<<<blocks, threads, smem_fp32>>>(
+                d_attn_Q, d_attn_K, d_attn_V, d_attn_O_flash, M, N_default, scale);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
             std::vector<float> h_naive((size_t)M * D);
             std::vector<float> h_flash((size_t)M * D);
             CUDA_CHECK(cudaMemcpy(h_naive.data(), d_attn_O_naive,
@@ -6758,10 +7059,100 @@ public:
                 if (diff > max_diff) max_diff = diff;
                 sum_diff += diff;
             }
-            printf("\n  Correctness check (max abs diff naive vs flash):\n");
+            printf("\n  Correctness (N=%d, max abs diff naive vs flash FP32):\n",
+                   N_default);
             printf("    Max abs diff:   %e\n", max_diff);
             printf("    Mean abs diff:  %e\n", sum_diff / ((size_t)M * D));
-            printf("    (FP32 round-off expected; values < 1e-3 are normal)\n");
+            printf("    (FP32 round-off; values < 1e-3 are normal)\n");
+        }
+
+        // ==================================================================
+        // Part 3: Power efficiency of flash attention (GpuMetricSampler)
+        // ==================================================================
+        printf("\n--- Power efficiency (Flash FP32, N=%d) ---\n", N_default);
+
+        int device = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        GpuMetricSampler sampler;
+        bool has_nvml = sampler.init(device);
+        if (!has_nvml) {
+            printf("  NVML unavailable - GFLOPS/W requires NVML.\n");
+            printf("  Running GPU-time-only measurement.\n");
+        } else {
+            unsigned int power_limit_mw = sampler.getPowerLimitMw();
+            printf("  NVML initialised. Power limit: ");
+            if (power_limit_mw > 0) printf("%.1f W\n", power_limit_mw / 1000.0);
+            else printf("unknown\n");
+        }
+
+        const double flops_per_iter = 4.0 * (double)M * (double)N_default * (double)D;
+
+        // Warmup
+        for (int i = 0; i < 3; i++) {
+            flash_attention_kernel<<<blocks, threads, smem_fp32>>>(
+                d_attn_Q, d_attn_K, d_attn_V, d_attn_O_flash, M, N_default, scale);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Run for ~softmax_power_duration_ms with the sampler active.
+        const int target_ms = config.softmax_power_duration_ms;
+        if (has_nvml) sampler.start(config.softmax_power_sample_ms);
+        CUDA_CHECK(cudaEventRecord(start_event));
+        auto wall_t0 = std::chrono::steady_clock::now();
+
+        long long total_flops = 0;
+        int launches = 0;
+        while (true) {
+            flash_attention_kernel<<<blocks, threads, smem_fp32>>>(
+                d_attn_Q, d_attn_K, d_attn_V, d_attn_O_flash, M, N_default, scale);
+            launches++;
+            total_flops += (long long)flops_per_iter;
+
+            auto wall_t1 = std::chrono::steady_clock::now();
+            int elapsed_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                wall_t1 - wall_t0).count();
+            if (elapsed_ms >= target_ms) break;
+        }
+
+        CUDA_CHECK(cudaEventRecord(stop_event));
+        CUDA_CHECK(cudaEventSynchronize(stop_event));
+        if (has_nvml) sampler.stop();
+
+        float gpu_ms = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&gpu_ms, start_event, stop_event));
+        double gflops = (total_flops / 1e9) / (gpu_ms / 1000.0);
+
+        printf("  GPU time:    %.2f s (%d launches)\n", gpu_ms / 1000.0, launches);
+        printf("  Total work:  %.3f GFLOP\n", total_flops / 1e9);
+        printf("  Throughput:  %.2f GFLOPS\n", gflops);
+
+        if (has_nvml) {
+            GpuMetricSampler::Stats stats = sampler.computeStats();
+            if (stats.valid) {
+                printf("  Power:       avg %.1f W, peak %.1f W\n",
+                       stats.avg_power_w, stats.peak_power_w);
+                printf("  SM clock:    avg %.0f MHz, peak %.0f MHz, min %.0f MHz\n",
+                       stats.avg_sm_clock_mhz, stats.peak_sm_clock_mhz,
+                       stats.min_sm_clock_mhz);
+                printf("  Mem clock:   avg %.0f MHz\n", stats.avg_mem_clock_mhz);
+                printf("  Temperature: avg %.1f C, peak %.1f C\n",
+                       stats.avg_temp_c, stats.peak_temp_c);
+                printf("  Clock drop:  %.1f%% (peak -> sustained avg)\n",
+                       stats.clock_drop_pct);
+                printf("  Throttle:    %zu/%zu samples",
+                       stats.throttle_samples, stats.total_samples);
+                if (stats.last_throttle_reasons) {
+                    printf(" [%s]",
+                           decodeThrottleReasons(stats.last_throttle_reasons).c_str());
+                }
+                printf("\n");
+                if (stats.avg_power_w > 0) {
+                    printf("  Efficiency:  %.3f GFLOPS/W  (%.2f GFLOPS / %.1f W)\n",
+                           gflops / stats.avg_power_w, gflops, stats.avg_power_w);
+                }
+            } else {
+                printf("  (NVML sampler did not collect enough samples.)\n");
+            }
         }
     }
 
