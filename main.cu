@@ -20,6 +20,11 @@
  * limitations under the License.
  */
 
+// "yo dude how many lines of code does the program have?"
+// "uhhh just under 9 thousand"
+// "across multiple files, right?"
+// *stares blankly*
+// "... across multiple files, right???"
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -3409,6 +3414,348 @@ __global__ void flash_attention_fp16_kernel(const __half* __restrict__ Q,
 #undef FA_BR
 #undef FA_BC
 #undef FA_D
+
+// ============================================================================
+// Additional benchmark kernels
+// ----------------------------------------------------------------------------
+// These kernels back six new benchmarks added to fill coverage gaps:
+//   - Warp-level primitives (__shfl_sync / __shfl_down_sync)
+//   - Random number generation (cuRAND XORWOW + Philox)
+//   - 3D finite-difference stencil (7- and 25-point)
+//   - Histogram (global atomics vs shared-memory privatisation)
+//   - Special-function-unit throughput (sin/cos/exp/log/rsqrt)
+//   - Mixed-precision WMMA GEMM (TF32 / BF16 on Ampere+)
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Warp shuffle kernels
+// ---------------------------------------------------------------------------
+
+// Warp-level reduction using __shfl_down_sync.
+// Each warp processes a contiguous chunk of `size / num_warps` elements.
+__global__ void warpShuffleReduceKernel(const float* __restrict__ input,
+                                        float* __restrict__ output,
+                                        int size, int iterations) {
+    int tid     = blockIdx.x * blockDim.x + threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane    = tid & 31;
+    int warps   = (gridDim.x * blockDim.x) >> 5;
+    int per_warp = (size + warps - 1) / warps;
+    int start = warp_id * per_warp;
+    int end   = start + per_warp;
+    if (end > size) end = size;
+
+    float sum = 0.0f;
+    for (int it = 0; it < iterations; ++it) {
+        sum = 0.0f;
+        for (int i = start + lane; i < end; i += 32) sum += input[i];
+        // Warp-level reduction via __shfl_down_sync
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            sum += __shfl_down_sync(0xffffffff, sum, off);
+        }
+        if (lane == 0) output[warp_id] = sum;
+    }
+}
+
+// Same reduction but using shared memory instead of shuffle instructions.
+// Provides a direct comparison point for warp-shuffle vs shmem.
+__global__ void sharedMemReduceKernel(const float* __restrict__ input,
+                                      float* __restrict__ output,
+                                      int size, int iterations) {
+    __shared__ float sdata[32];
+    int tid     = blockIdx.x * blockDim.x + threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane    = tid & 31;
+    int warps   = (gridDim.x * blockDim.x) >> 5;
+    int per_warp = (size + warps - 1) / warps;
+    int start = warp_id * per_warp;
+    int end   = start + per_warp;
+    if (end > size) end = size;
+
+    for (int it = 0; it < iterations; ++it) {
+        float sum = 0.0f;
+        for (int i = start + lane; i < end; i += 32) sum += input[i];
+        sdata[lane] = sum;
+        __syncthreads();
+        // Sequential reduction in shared memory (no shuffle instructions)
+        if (lane == 0) {
+            for (int i = 1; i < 32; ++i) sdata[0] += sdata[i];
+            output[warp_id] = sdata[0];
+        }
+        __syncthreads();
+    }
+}
+
+// Exercises __shfl_sync broadcast (lane 0 -> all lanes).
+// Throughput-limited by the shfl instruction issue rate.
+__global__ void warpShuffleBroadcastKernel(const float* __restrict__ input,
+                                           float* __restrict__ output,
+                                           int size, int iterations) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float v = 0.0f;
+    for (int it = 0; it < iterations; ++it) {
+        v = __shfl_sync(0xffffffff, input[idx], 0);
+    }
+    output[idx] = v;
+}
+
+// ---------------------------------------------------------------------------
+// cuRAND kernels
+// ---------------------------------------------------------------------------
+
+// XORWOW generator — 32-bit state, default curandState. Fast but sequential
+// per-thread state. Generates one float per call to curand_uniform.
+__global__ void curandXORWOWKernel(float* __restrict__ output,
+                                   int size, unsigned long long seed,
+                                   int per_thread) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    curandStateXORWOW state;
+    curand_init(seed, idx, 0, &state);
+    float sum = 0.0f;
+    #pragma unroll 1
+    for (int i = 0; i < per_thread; ++i) {
+        sum += curand_uniform(&state);
+    }
+    // Write to global memory so the RNG work is not optimised away.
+    output[idx] = sum;
+}
+
+// Philox4_32_10 generator — counter-based, designed for parallel execution.
+// Generates four floats per call via curand_uniform4.
+__global__ void curandPhiloxKernel(float4* __restrict__ output,
+                                   int size, unsigned long long seed,
+                                   int per_thread) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    curandStatePhilox4_32_10_t state;
+    curand_init(seed, idx, 0, &state);
+    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    #pragma unroll 1
+    for (int i = 0; i < per_thread; ++i) {
+        float4 r = curand_uniform4(&state);
+        sum.x += r.x; sum.y += r.y; sum.z += r.z; sum.w += r.w;
+    }
+    output[idx] = sum;
+}
+
+// ---------------------------------------------------------------------------
+// 3D stencil kernels (7-point and 25-point heat-equation stencils)
+// ---------------------------------------------------------------------------
+// Tile in X-Y using shared memory halo, Z is the slow axis.  The tile
+// (including halo) has SX*SY cells but the thread block only has TX*TY
+// threads, so the load phase uses a stride loop (cooperative loading) to
+// populate every cell of smem — including the right/bottom halo rows that
+// a naive "one thread per cell" mapping would skip.
+template <int RADIUS>
+__global__ void stencil3DKernel(const float* __restrict__ input,
+                                float* __restrict__ output,
+                                int Nx, int Ny, int Nz) {
+    // Tile size in X and Y.  Halo of RADIUS cells on each side.
+    constexpr int TX = 32;
+    constexpr int TY = 8;
+    constexpr int SX = TX + 2 * RADIUS;
+    constexpr int SY = TY + 2 * RADIUS;
+    constexpr int ZR = 1;            // Z radius is always 1 (zm, zp only)
+    __shared__ float smem[SX * SY];
+
+    int gz  = blockIdx.z;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int bdim = blockDim.x * blockDim.y;
+
+    // Cooperative load: stride through every cell of the (SX x SY) tile.
+    // Each thread may load one or two cells depending on RADIUS.
+    // gx, gy are the global coordinates corresponding to smem cell (sx, sy);
+    // they may be negative or >= Nx/Ny when loading the outer halo, in
+    // which case we substitute 0 (clamped boundary).
+    for (int i = tid; i < SX * SY; i += bdim) {
+        int sy = i / SX;
+        int sx = i % SX;
+        int gx = blockIdx.x * TX + sx - RADIUS;
+        int gy = blockIdx.y * TY + sy - RADIUS;
+        if (gx >= 0 && gx < Nx && gy >= 0 && gy < Ny && gz >= 0 && gz < Nz) {
+            smem[i] = input[(size_t)gz * Nx * Ny + (size_t)gy * Nx + gx];
+        } else {
+            smem[i] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Compute phase: thread (tx, ty) handles one interior cell.
+    // The interior cell maps to smem[(ty + RADIUS) * SX + (tx + RADIUS)]
+    // — the +RADIUS offset skips the top/left halo.
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int ix = blockIdx.x * TX + tx;
+    int iy = blockIdx.y * TY + ty;
+
+    if (ix >= Nx || iy >= Ny || gz >= Nz) return;
+    // Skip border cells so all neighbour reads are in-bounds (both in
+    // smem and in global memory for the Z neighbours).
+    if (ix < RADIUS || ix >= Nx - RADIUS) return;
+    if (iy < RADIUS || iy >= Ny - RADIUS) return;
+    if (gz < ZR     || gz >= Nz - ZR)     return;
+
+    size_t out_idx = (size_t)gz * Nx * Ny + (size_t)iy * Nx + ix;
+    if (RADIUS == 1) {
+        // 7-point stencil: average of 6 face neighbours (no center).
+        float xm = smem[(ty + RADIUS)     * SX + (tx + RADIUS - 1)];
+        float xp = smem[(ty + RADIUS)     * SX + (tx + RADIUS + 1)];
+        float ym = smem[(ty + RADIUS - 1) * SX + (tx + RADIUS)    ];
+        float yp = smem[(ty + RADIUS + 1) * SX + (tx + RADIUS)    ];
+        float zm = input[(size_t)(gz - 1) * Nx * Ny + (size_t)iy * Nx + ix];
+        float zp = input[(size_t)(gz + 1) * Nx * Ny + (size_t)iy * Nx + ix];
+        output[out_idx] = (xm + xp + ym + yp + zm + zp) * (1.0f / 6.0f);
+    } else {
+        // 25-point stencil: 5x5 in XY (radius 2) + 2 z-neighbours = 27 reads.
+        float acc = 0.0f;
+        #pragma unroll
+        for (int dy = -RADIUS; dy <= RADIUS; ++dy) {
+            #pragma unroll
+            for (int dx = -RADIUS; dx <= RADIUS; ++dx) {
+                acc += smem[(ty + RADIUS + dy) * SX + (tx + RADIUS + dx)];
+            }
+        }
+        acc += input[(size_t)(gz - 1) * Nx * Ny + (size_t)iy * Nx + ix];
+        acc += input[(size_t)(gz + 1) * Nx * Ny + (size_t)iy * Nx + ix];
+        output[out_idx] = acc * (1.0f / 27.0f);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Histogram kernels
+// ---------------------------------------------------------------------------
+#define HIST_BINS 256
+
+// Global-atomic histogram: every thread atomicAdds to a single shared global
+// histogram.  High contention on popular bin values.
+__global__ void histogramGlobalAtomicsKernel(const unsigned char* __restrict__ data,
+                                             int* __restrict__ hist,
+                                             int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    atomicAdd(&hist[data[idx]], 1);
+}
+
+// Shared-memory privatised histogram: each block builds its own histogram in
+// shared memory (low contention), then merges to global with a single
+// atomicAdd per bin per block.
+__global__ void histogramSharedPrivKernel(const unsigned char* __restrict__ data,
+                                          int* __restrict__ hist,
+                                          int size) {
+    __shared__ int shist[HIST_BINS];
+    int tid = threadIdx.x;
+    // Initialise shared histogram
+    for (int i = tid; i < HIST_BINS; i += blockDim.x) shist[i] = 0;
+    __syncthreads();
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = idx; i < size; i += stride) {
+        atomicAdd(&shist[data[i]], 1);
+    }
+    __syncthreads();
+
+    // Merge block-local histogram into the global histogram
+    for (int i = tid; i < HIST_BINS; i += blockDim.x) {
+        if (shist[i] > 0) atomicAdd(&hist[i], shist[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Special function unit (SFU) throughput kernel
+// ---------------------------------------------------------------------------
+// The SFU pipeline handles sin/cos/exp/log/rsqrt/sqrt with limited throughput
+// (typically 1/4 or 1/8 of FP32 rate).  This kernel stresses each operation
+// in turn so we can measure per-op throughput.
+__global__ void sfuThroughputKernel(float* __restrict__ data,
+                                    int size, int op, int iterations) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float v = data[idx];
+    float r = v;
+    #pragma unroll 1
+    for (int i = 0; i < iterations; ++i) {
+        switch (op) {
+            case 0: r = sinf(v);   v = r + 0.0001f; break;
+            case 1: r = cosf(v);   v = r + 0.0001f; break;
+            case 2: r = expf(v);   v = r * 0.5f;    break;
+            case 3: r = logf(v + 1.0f); v = r + 0.0001f; break;
+            case 4: r = rsqrtf(v + 0.1f); v = r; break;
+            case 5: r = sqrtf(v + 0.1f);  v = r; break;
+            case 6: r = __sinf(v);  v = r + 0.0001f; break;  // fast intrinsics
+            case 7: r = __expf(v);  v = r * 0.5f;    break;
+        }
+    }
+    data[idx] = r;
+}
+
+// ---------------------------------------------------------------------------
+// Mixed-precision WMMA GEMM kernels (TF32 + BF16, Ampere+)
+// ---------------------------------------------------------------------------
+// TF32 tensor-core path: 16x16x8 fragments, float inputs, TF32 matmul.
+// Only available on compute capability 8.0+ (Ampere and later).  The kernel
+// is always declared so that host code can take its address for the launch
+// stub, but the body is empty on pre-Ampere arches — host code must check
+// the runtime SM version before launching.
+__global__ void wmma_gemm_tf32_kernel(float const* __restrict__ A,
+                                      float const* __restrict__ B,
+                                      float* __restrict__ C,
+                                      int M, int N, int K) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    using namespace nvcuda::wmma;
+    int warp_m = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int warp_n = blockIdx.y;
+    if (warp_m * 16 >= M || warp_n * 16 >= N) return;
+
+    fragment<matrix_a, 16, 16, 8, precision::tf32, row_major> a_frag;
+    fragment<matrix_b, 16, 16, 8, precision::tf32, row_major> b_frag;
+    fragment<accumulator, 16, 16, 8, float> c_frag;
+    fill_fragment(c_frag, 0.0f);
+
+    for (int k = 0; k < K; k += 8) {
+        load_matrix_sync(a_frag, A + (size_t)warp_m * 16 * K + k, K);
+        load_matrix_sync(b_frag, B + (size_t)k * N + warp_n * 16, N);
+        mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+    store_matrix_sync(C + (size_t)warp_m * 16 * N + warp_n * 16,
+                      c_frag, N, mem_row_major);
+#else
+    // Pre-Ampere build: kernel is a no-op.  Host code must guard the launch
+    // with a runtime SM check (see benchmarkMixedPrecisionGEMM).
+#endif
+}
+
+// BF16 tensor-core path: 16x16x16 fragments, nv_bfloat16 inputs, float accum.
+// Same Ampere+ requirement and same no-op-on-older-SM behaviour as above.
+__global__ void wmma_gemm_bf16_kernel(__nv_bfloat16 const* __restrict__ A,
+                                      __nv_bfloat16 const* __restrict__ B,
+                                      float* __restrict__ C,
+                                      int M, int N, int K) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    using namespace nvcuda::wmma;
+    int warp_m = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int warp_n = blockIdx.y;
+    if (warp_m * 16 >= M || warp_n * 16 >= N) return;
+
+    fragment<matrix_a, 16, 16, 16, nv_bfloat16, row_major> a_frag;
+    fragment<matrix_b, 16, 16, 16, nv_bfloat16, row_major> b_frag;
+    fragment<accumulator, 16, 16, 16, float> c_frag;
+    fill_fragment(c_frag, 0.0f);
+
+    for (int k = 0; k < K; k += 16) {
+        load_matrix_sync(a_frag, A + (size_t)warp_m * 16 * K + k, K);
+        load_matrix_sync(b_frag, B + (size_t)k * N + warp_n * 16, N);
+        mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+    store_matrix_sync(C + (size_t)warp_m * 16 * N + warp_n * 16,
+                      c_frag, N, mem_row_major);
+#else
+    // Pre-Ampere build: no-op.
+#endif
+}
 
 class RenderBenchmark {
 private:
@@ -7825,6 +8172,396 @@ public:
         if (owns_d_workload) cudaFree(d_workload);
     }
 
+    // ======================================================================
+    // Warp shuffle benchmark
+    // ----------------------------------------------------------------------
+    // Measures throughput of warp-level intrinsics:
+    //   - __shfl_down_sync for warp reduction
+    //   - __shfl_sync for broadcast
+    // Compared against the same reduction done in shared memory, so the
+    // user can see how much faster shuffle-based primitives are.
+    // ======================================================================
+    void benchmarkWarpShuffle() {
+        printf("\n=== Warp Shuffle Benchmark ===\n");
+
+        const int size = 1 << 20;     // 1M floats
+        const int iters = 200;
+
+        float* d_in  = nullptr;
+        float* d_out = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_in,  size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_out, size * sizeof(float)));
+
+        std::vector<float> h_in(size);
+        for (auto& v : h_in) v = (float)rand() / RAND_MAX;
+        CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), size * sizeof(float),
+                              cudaMemcpyHostToDevice));
+
+        dim3 blockSize(256);                  // 8 warps per block
+        dim3 gridSize((size + blockSize.x - 1) / blockSize.x);
+
+        // --- Warp-shuffle reduction ---
+        GpuTimer t1;
+        t1.startEvent();
+        warpShuffleReduceKernel<<<gridSize, blockSize>>>(d_in, d_out, size, iters);
+        float ms_shfl = t1.stopMs();
+
+        // --- Shared-memory reduction (same work, no shuffles) ---
+        GpuTimer t2;
+        t2.startEvent();
+        sharedMemReduceKernel<<<gridSize, blockSize>>>(d_in, d_out, size, iters);
+        float ms_shmem = t2.stopMs();
+
+        // --- Broadcast (single __shfl_sync per element) ---
+        GpuTimer t3;
+        t3.startEvent();
+        warpShuffleBroadcastKernel<<<gridSize, blockSize>>>(d_in, d_out, size, iters);
+        float ms_bcast = t3.stopMs();
+
+        // Throughput: each reduction iter does (size / 32) lanes worth of work
+        // plus a 5-step shfl tree per warp.
+        double reduce_elems = (double)size * iters;
+        printf("Shfl-reduce:   %.3f ms  (%.2f GElem/s)\n",
+               ms_shfl,  reduce_elems / (ms_shfl  * 1e6));
+        printf("Shmem-reduce:  %.3f ms  (%.2f GElem/s)\n",
+               ms_shmem, reduce_elems / (ms_shmem * 1e6));
+        printf("Shuffle speedup over shmem: %.2fx\n", ms_shmem / ms_shfl);
+        printf("Shfl-broadcast: %.3f ms  (%.2f GShfl/s)\n",
+               ms_bcast, (double)size * iters / (ms_bcast * 1e6));
+
+        cudaFree(d_in);
+        cudaFree(d_out);
+        printf("\n");
+    }
+
+    // ======================================================================
+    // Random number generation benchmark (cuRAND)
+    // ----------------------------------------------------------------------
+    // Measures throughput of the two most common cuRAND generators:
+    //   - XORWOW (default, fast, 32-bit state, 1 number per call)
+    //   - Philox4_32_10 (counter-based, parallel-friendly, 4 numbers per call)
+    // Both are initialised inside the kernel to amortise state setup over
+    // many RNG calls.
+    // ======================================================================
+    void benchmarkRandomGeneration() {
+        printf("\n=== Random Number Generation (cuRAND) Benchmark ===\n");
+
+        const int size = 1 << 20;     // 1M threads
+        const int per_thread = 64;    // generate 64 numbers per thread
+        const unsigned long long seed = 12345ULL;
+
+        float*  d_xorwow_out = nullptr;
+        float4* d_philox_out = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_xorwow_out, (size_t)size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_philox_out, (size_t)size * sizeof(float4)));
+
+        dim3 blockSize(256);
+        dim3 gridSize((size + blockSize.x - 1) / blockSize.x);
+
+        // --- XORWOW ---
+        GpuTimer t1;
+        t1.startEvent();
+        curandXORWOWKernel<<<gridSize, blockSize>>>(
+            d_xorwow_out, size, seed, per_thread);
+        float ms_xor = t1.stopMs();
+
+        // --- Philox (4 numbers per call) ---
+        GpuTimer t2;
+        t2.startEvent();
+        curandPhiloxKernel<<<gridSize, blockSize>>>(
+            d_philox_out, size, seed, per_thread);
+        float ms_phil = t2.stopMs();
+
+        double xorwow_nums  = (double)size * per_thread;
+        double philox_nums  = (double)size * per_thread * 4.0;  // float4
+        printf("XORWOW:  %.3f ms  (%.2f GRN/s, %.2f GB/s)\n",
+               ms_xor,  xorwow_nums / (ms_xor  * 1e6),
+               xorwow_nums * sizeof(float) / (ms_xor  * 1e6));
+        printf("Philox:  %.3f ms  (%.2f GRN/s, %.2f GB/s)\n",
+               ms_phil, philox_nums / (ms_phil * 1e6),
+               philox_nums * sizeof(float) / (ms_phil * 1e6));
+        printf("Philox speedup (per-number): %.2fx\n",
+               (xorwow_nums / ms_xor) / (philox_nums / ms_phil));
+
+        cudaFree(d_xorwow_out);
+        cudaFree(d_philox_out);
+        printf("\n");
+    }
+
+    // ======================================================================
+    // 3D finite-difference stencil benchmark
+    // ----------------------------------------------------------------------
+    // Stencil kernels are the canonical HPC memory-bound workload.  We run
+    // two flavours on a 256x256x64 volume:
+    //   - 7-point stencil (1 layer of face neighbours in each direction)
+    //   - 25-point stencil (5x5 in XY + 2 Z-neighbours, radius 2)
+    // Both are tiled in X-Y with shared-memory halos; Z is read directly
+    // from global memory (only 2 z-neighbours per cell).
+    // ======================================================================
+    void benchmarkStencil3D() {
+        printf("\n=== 3D Stencil Benchmark ===\n");
+
+        const int Nx = 256, Ny = 256, Nz = 64;
+        const size_t vol = (size_t)Nx * Ny * Nz;
+
+        float* d_in  = nullptr;
+        float* d_out = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_in,  vol * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_out, vol * sizeof(float)));
+
+        std::vector<float> h_in(vol);
+        for (auto& v : h_in) v = (float)rand() / RAND_MAX;
+        CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), vol * sizeof(float),
+                              cudaMemcpyHostToDevice));
+
+        // 2D thread block, 3D grid (Z is grid.z)
+        dim3 blockSize(32, 8);
+        dim3 gridSize((Nx + blockSize.x - 1) / blockSize.x,
+                      (Ny + blockSize.y - 1) / blockSize.y,
+                      Nz);
+
+        // --- 7-point stencil ---
+        GpuTimer t1;
+        t1.startEvent();
+        stencil3DKernel<1><<<gridSize, blockSize>>>(d_in, d_out, Nx, Ny, Nz);
+        float ms7 = t1.stopMs();
+
+        // --- 25-point stencil ---
+        GpuTimer t2;
+        t2.startEvent();
+        stencil3DKernel<2><<<gridSize, blockSize>>>(d_in, d_out, Nx, Ny, Nz);
+        float ms25 = t2.stopMs();
+
+        // Each 7-point update reads 7 floats + writes 1 (32 bytes)
+        // Each 25-point update reads 27 floats + writes 1 (~112 bytes)
+        double bytes7  = (double)vol * (7 + 1) * sizeof(float);
+        double bytes25 = (double)vol * (27 + 1) * sizeof(float);
+        printf("Volume: %dx%dx%d (%.2f MB)\n",
+               Nx, Ny, Nz, (double)vol * sizeof(float) / 1e6);
+        printf("7-point:  %.3f ms  (%.2f GB/s)\n",
+               ms7,  bytes7  / (ms7  * 1e6));
+        printf("25-point: %.3f ms  (%.2f GB/s)\n",
+               ms25, bytes25 / (ms25 * 1e6));
+
+        cudaFree(d_in);
+        cudaFree(d_out);
+        printf("\n");
+    }
+
+    // ======================================================================
+    // Histogram benchmark
+    // ----------------------------------------------------------------------
+    // Compares two histogram implementations on uniform random byte data:
+    //   - global-atomic: every thread atomicAdds directly to the global
+    //     histogram (high contention on popular bins)
+    //   - shared-private: each block builds its own histogram in shared
+    //     memory, then merges to global with one atomicAdd per bin
+    // The private version should be much faster as it removes nearly all
+    // global atomic contention.
+    // ======================================================================
+    void benchmarkHistogram() {
+        printf("\n=== Histogram Benchmark ===\n");
+
+        const int size = 1 << 22;     // 4M bytes of input
+        const int bins = HIST_BINS;
+
+        unsigned char* d_data = nullptr;
+        int* d_hist = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_data, size * sizeof(unsigned char)));
+        CUDA_CHECK(cudaMalloc(&d_hist, bins * sizeof(int)));
+
+        std::vector<unsigned char> h_data(size);
+        for (auto& v : h_data) v = (unsigned char)(rand() & 0xFF);
+        CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), size,
+                              cudaMemcpyHostToDevice));
+
+        dim3 blockSize(256);
+        dim3 gridSize((size + blockSize.x - 1) / blockSize.x);
+
+        // --- Global atomic histogram ---
+        CUDA_CHECK(cudaMemset(d_hist, 0, bins * sizeof(int)));
+        GpuTimer t1;
+        t1.startEvent();
+        histogramGlobalAtomicsKernel<<<gridSize, blockSize>>>(d_data, d_hist, size);
+        float ms_g = t1.stopMs();
+
+        // --- Shared-memory privatised histogram ---
+        CUDA_CHECK(cudaMemset(d_hist, 0, bins * sizeof(int)));
+        GpuTimer t2;
+        t2.startEvent();
+        histogramSharedPrivKernel<<<gridSize, blockSize>>>(d_data, d_hist, size);
+        float ms_s = t2.stopMs();
+
+        printf("Input: %d bytes, %d bins\n", size, bins);
+        printf("Global atomics:   %.3f ms  (%.2f GB/s)\n",
+               ms_g, (double)size / (ms_g * 1e6));
+        printf("Shared-private:   %.3f ms  (%.2f GB/s)\n",
+               ms_s, (double)size / (ms_s * 1e6));
+        printf("Privatisation speedup: %.2fx\n", ms_g / ms_s);
+
+        cudaFree(d_data);
+        cudaFree(d_hist);
+        printf("\n");
+    }
+
+    // ======================================================================
+    // Special-function-unit (SFU) throughput benchmark
+    // ----------------------------------------------------------------------
+    // The SFU pipeline handles transcendentals (sin, cos, exp, log, rsqrt,
+    // sqrt) at a fraction of the FP32 issue rate.  We exercise each
+    // operation on a 1M-element array with 200 iterations per element so
+    // the SFU becomes the bottleneck.
+    // ======================================================================
+    void benchmarkSFUThroughput() {
+        printf("\n=== SFU Throughput Benchmark ===\n");
+
+        const int size = 1 << 20;     // 1M elements
+        const int iters = 200;
+        float* d_data = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_data, size * sizeof(float)));
+
+        std::vector<float> h_data(size);
+        for (auto& v : h_data) v = 0.5f + (float)rand() / RAND_MAX;
+        CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), size * sizeof(float),
+                              cudaMemcpyHostToDevice));
+
+        dim3 blockSize(256);
+        dim3 gridSize((size + blockSize.x - 1) / blockSize.x);
+
+        const char* op_names[] = {
+            "sinf", "cosf", "expf", "logf",
+            "rsqrtf", "sqrtf", "__sinf (fast)", "__expf (fast)"
+        };
+        const int num_ops = sizeof(op_names) / sizeof(op_names[0]);
+
+        printf("%-18s %10s %12s\n", "Operation", "Time (ms)", "GOPS");
+        for (int op = 0; op < num_ops; ++op) {
+            // Reset data so the same workload is performed every iteration.
+            CUDA_CHECK(cudaMemcpy(d_data, h_data.data(),
+                                  size * sizeof(float),
+                                  cudaMemcpyHostToDevice));
+            GpuTimer t;
+            t.startEvent();
+            sfuThroughputKernel<<<gridSize, blockSize>>>(
+                d_data, size, op, iters);
+            float ms = t.stopMs();
+            double gops = (double)size * iters / (ms * 1e6);
+            printf("%-18s %10.3f %12.2f\n", op_names[op], ms, gops);
+        }
+
+        cudaFree(d_data);
+        printf("\n");
+    }
+
+    // ======================================================================
+    // Mixed-precision WMMA GEMM benchmark (TF32 + BF16)
+    // ----------------------------------------------------------------------
+    // Extends the existing FP16 tensor-core benchmark with two more recent
+    // tensor-core paths used heavily in DL training and inference:
+    //   - TF32 (Ampere+):  float inputs, 19-bit mantissa matmul
+    //   - BF16  (Ampere+): __nv_bfloat16 inputs, 8-bit exponent / 7-bit
+    //     mantissa, float accumulator
+    // Kernels are guarded by __CUDA_ARCH__ >= 800; on older GPUs we print
+    // a skip message so the benchmark slot is still visible in the table.
+    // ======================================================================
+    void benchmarkMixedPrecisionGEMM() {
+        printf("\n=== Mixed Precision WMMA GEMM Benchmark ===\n");
+
+        int dev = 0;
+        cudaDeviceProp prop;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+        bool sm_ok = (prop.major >= 8);
+
+        const int M = 1024, N = 1024, K = 1024;
+        const size_t Asz = (size_t)M * K;
+        const size_t Bsz = (size_t)K * N;
+        const size_t Csz = (size_t)M * N;
+
+        if (!sm_ok) {
+            printf("TF32/BF16 tensor cores require SM 8.0+ (this GPU is "
+                   "SM %d.%d) - skipping\n", prop.major, prop.minor);
+            printf("\n");
+            return;
+        }
+
+        // ---- TF32 path (float inputs) ----
+        {
+            float *d_A, *d_B, *d_C;
+            CUDA_CHECK(cudaMalloc(&d_A, Asz * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_B, Bsz * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_C, Csz * sizeof(float)));
+
+            std::vector<float> hA(Asz), hB(Bsz);
+            for (auto& v : hA) v = (float)rand() / RAND_MAX * 0.1f;
+            for (auto& v : hB) v = (float)rand() / RAND_MAX * 0.1f;
+            CUDA_CHECK(cudaMemcpy(d_A, hA.data(), Asz * sizeof(float),
+                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_B, hB.data(), Bsz * sizeof(float),
+                                  cudaMemcpyHostToDevice));
+
+            dim3 grid(M / 16, N / 16);
+            dim3 block(32);
+
+            // Warm-up
+            wmma_gemm_tf32_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            GpuTimer t;
+            t.startEvent();
+            wmma_gemm_tf32_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+            float ms = t.stopMs();
+            double gflops = 2.0 * (double)M * N * K / (ms * 1e6);
+
+            printf("TF32 GEMM: M=%d N=%d K=%d  %.3f ms  %.2f TFLOP/s\n",
+                   M, N, K, ms, gflops / 1000.0);
+
+            cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+        }
+
+        // ---- BF16 path ----
+        {
+            __nv_bfloat16 *d_A, *d_B;
+            float *d_C;
+            CUDA_CHECK(cudaMalloc(&d_A, Asz * sizeof(__nv_bfloat16)));
+            CUDA_CHECK(cudaMalloc(&d_B, Bsz * sizeof(__nv_bfloat16)));
+            CUDA_CHECK(cudaMalloc(&d_C, Csz * sizeof(float)));
+
+            std::vector<float>  hAf(Asz), hBf(Bsz);
+            std::vector<__nv_bfloat16> hA(Asz), hB(Bsz);
+            for (auto& v : hAf) v = (float)rand() / RAND_MAX * 0.1f;
+            for (auto& v : hBf) v = (float)rand() / RAND_MAX * 0.1f;
+            for (size_t i = 0; i < Asz; ++i) hA[i] = __float2bfloat16(hAf[i]);
+            for (size_t i = 0; i < Bsz; ++i) hB[i] = __float2bfloat16(hBf[i]);
+            CUDA_CHECK(cudaMemcpy(d_A, hA.data(), Asz * sizeof(__nv_bfloat16),
+                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_B, hB.data(), Bsz * sizeof(__nv_bfloat16),
+                                  cudaMemcpyHostToDevice));
+
+            dim3 grid(M / 16, N / 16);
+            dim3 block(32);
+
+            // Warm-up
+            wmma_gemm_bf16_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            GpuTimer t;
+            t.startEvent();
+            wmma_gemm_bf16_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+            float ms = t.stopMs();
+            double gflops = 2.0 * (double)M * N * K / (ms * 1e6);
+
+            printf("BF16 GEMM: M=%d N=%d K=%d  %.3f ms  %.2f TFLOP/s\n",
+                   M, N, K, ms, gflops / 1000.0);
+
+            cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+        }
+
+        printf("(Compare against the FP16 WMMA result in the TensorCores "
+               "benchmark)\n");
+        printf("\n");
+    }
+
     void runAllBenchmarks() {
         printf("                  ---  CUBench  ---\n");
         printf(" The Definitive Open-Source GPU Benchmarking Utility\n");
@@ -7882,6 +8619,7 @@ public:
                 "If your GPU starts speaking in binary, don't be alarmed.",
                 "This benchmark is powered by caffeine and sheer determination.",
                 "If your GPU starts glowing, get better fans.",
+                "CUBench: Now with... *Unfurls mile long scroll* oh dear...",
             };
             int num_msgs = sizeof(funny_messages) / sizeof(funny_messages[0]);
             srand((unsigned int)time(NULL) + deviceId); // Add deviceId for variation
@@ -7923,7 +8661,6 @@ public:
             // Rest of the benchmark code remains the same (list of benchmark lambdas, capture function, etc.)
             struct BenchCall { const char* name; std::function<void(RenderBenchmark*)> fn; };
             std::vector<BenchCall> bench_calls = {
-                // ... (keep all the existing benchmark calls)
                 {"Rasterisation", [](auto self){ self->benchmarkRasterisation(); }},
                 {"Particles", [](auto self){ self->benchmarkParticles(); }},
                 {"RayTracing", [](auto self){ self->benchmarkRayTracing(); }},
@@ -7974,6 +8711,13 @@ public:
                 {"NUMA_Bandwidth", [](auto self){ self->benchmarkNUMABandwidth(); }},
                 {"NVLink_Bandwidth", [](auto self){ self->benchmarkNVLinkBandwidth(); }},
                 {"PowerEfficiency", [](auto self){ self->benchmarkPowerEfficiency(); }},
+                // New benchmarks added to fill coverage gaps.
+                {"WarpShuffle", [](auto self){ self->benchmarkWarpShuffle(); }},
+                {"RNG_Throughput", [](auto self){ self->benchmarkRandomGeneration(); }},
+                {"Stencil3D", [](auto self){ self->benchmarkStencil3D(); }},
+                {"Histogram", [](auto self){ self->benchmarkHistogram(); }},
+                {"SFU_Throughput", [](auto self){ self->benchmarkSFUThroughput(); }},
+                {"MixedPrecisionGEMM", [](auto self){ self->benchmarkMixedPrecisionGEMM(); }},
             };
 
             struct BenchResult {
