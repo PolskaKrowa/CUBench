@@ -21,7 +21,7 @@
  */
 
 // "yo dude how many lines of code does the program have?"
-// "uhhh just under 9 thousand"
+// "uhhh just over 9 thousand"
 // "across multiple files, right?"
 // *stares blankly*
 // "... across multiple files, right???"
@@ -1322,6 +1322,22 @@ struct BenchmarkConfig {
     // Duration (ms) for the power-efficiency measurement of flash attention.
     int softmax_power_duration_ms = 1500;
     int softmax_power_sample_ms   = 50;
+
+    // --------------------------------------------------------------------
+    // Output mode flags (set via command-line arguments).
+    // --------------------------------------------------------------------
+    // json_output_mode: when true, benchmark results are parsed into a
+    //   structured JSON document and written to json_output_file instead of
+    //   being printed in the side-by-side column layout.
+    bool json_output_mode = false;
+    // json_output_file: destination path for the JSON document.  Only used
+    //   when json_output_mode is true.
+    std::string json_output_file = "cubench_results.json";
+    // headless_mode: when true, the program runs without any interactive
+    //   terminal prompts — it exits immediately after the JSON file has been
+    //   written.  Only valid when json_output_mode is also true (enforced in
+    //   main()); using --headless without --json is a hard error.
+    bool headless_mode = false;
 };
 
 // Vertex structure
@@ -3755,6 +3771,107 @@ __global__ void wmma_gemm_bf16_kernel(__nv_bfloat16 const* __restrict__ A,
 #else
     // Pre-Ampere build: no-op.
 #endif
+}
+
+// ============================================================================
+// JSON output helpers
+//
+// These utilities convert the captured stdout of each benchmark into a list
+// of key/value pairs which are then serialised into the JSON document written
+// at the end of the run (only when --json is supplied on the command line).
+// ============================================================================
+
+// Escape a string for safe inclusion inside a JSON string literal.
+// Handles the mandatory escapes (", \, control chars) per RFC 8259.
+static std::string jsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// A single key/value pair extracted from a benchmark's text output.
+struct BenchKV {
+    std::string key;
+    std::string value;
+};
+
+// Parse a benchmark's captured stdout into a list of key/value pairs.
+//
+// Parsing rules (kept deliberately simple so the output of every existing
+// benchmark is handled uniformly):
+//   * Empty lines are skipped.
+//   * Separator lines (containing only '-', '=', '+', '|', or spaces, e.g.
+//     "------ -------- ------------") are skipped.
+//   * Section header lines beginning with "===" (e.g. "=== Foo ===") are
+//     skipped.
+//   * Lines containing a colon are split at the FIRST colon into key:value.
+//     Both sides are trimmed of surrounding whitespace.
+//   * Any other non-empty line is stored verbatim under the synthetic key
+//     "raw_line" so no information is lost (this is how multi-column table
+//     rows are preserved — each row becomes one raw_line entry).
+static std::vector<BenchKV> parseBenchmarkOutput(const std::string& output) {
+    std::vector<BenchKV> results;
+    std::istringstream iss(output);
+    std::string line;
+    while (std::getline(iss, line)) {
+        // Trim leading/trailing whitespace (spaces, tabs, CR).
+        size_t start = line.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) continue;          // blank line
+        size_t end = line.find_last_not_of(" \t\r\n");
+        std::string t = line.substr(start, end - start + 1);
+
+        // Skip separator-only lines (dashes/equals/pluses/pipes/spaces).
+        bool is_sep = !t.empty();
+        for (char c : t) {
+            if (c != '-' && c != '=' && c != '+' && c != '|' && c != ' ') {
+                is_sep = false;
+                break;
+            }
+        }
+        if (is_sep) continue;
+
+        // Skip section headers like "=== Foo Benchmark ===".
+        if (t.size() >= 3 && t[0] == '=' && t[1] == '=' && t[2] == '=') continue;
+
+        // Try to split at the first colon → key:value.
+        size_t colon = t.find(':');
+        if (colon != std::string::npos) {
+            std::string k = t.substr(0, colon);
+            std::string v = t.substr(colon + 1);
+            // Trim both halves.
+            size_t ks = k.find_first_not_of(" \t");
+            size_t ke = k.find_last_not_of(" \t");
+            k = (ks == std::string::npos) ? std::string() : k.substr(ks, ke - ks + 1);
+            size_t vs = v.find_first_not_of(" \t");
+            size_t ve = v.find_last_not_of(" \t");
+            v = (vs == std::string::npos) ? std::string() : v.substr(vs, ve - vs + 1);
+            results.push_back({k, v});
+        } else {
+            // No colon → preserve the raw line so table rows / descriptive
+            // text are not silently dropped.
+            results.push_back({"raw_line", t});
+        }
+    }
+    return results;
 }
 
 class RenderBenchmark {
@@ -8578,6 +8695,11 @@ public:
         
         printf("Detected %d CUDA-capable device(s)\n\n", deviceCount);
         
+        // Accumulated JSON text for each GPU (only populated when
+        // json_output_mode is on; the combined document is written to disk
+        // after the per-GPU loop completes).
+        std::vector<std::string> gpu_json_entries;
+        
         // Loop through each GPU
         for (int deviceId = 0; deviceId < deviceCount; deviceId++) {
             printf("\n");
@@ -8762,81 +8884,293 @@ public:
                 progress.finish_all();
             }
 
-            // Print results in columns, balancing by output length (lines) per column
-            printf("\n--- Benchmark Results ---\n\n");
-            const int num_cols = 3;
-            size_t num_bench = results.size();
+            // ---------------------------------------------------------------
+            // JSON output path (only when --json is supplied).
+            //
+            // Parse each captured benchmark result into structured key/value
+            // pairs and accumulate a JSON object describing this GPU.  The
+            // accumulated per-GPU objects are joined into a single JSON
+            // document and written to disk after the per-GPU loop finishes.
+            // ---------------------------------------------------------------
+            if (config.json_output_mode) {
+                std::string gpu_json;
+                gpu_json += "    {\n";
 
-            // Count lines in each result
-            std::vector<size_t> bench_lines(num_bench, 0);
-            for (size_t i = 0; i < num_bench; ++i) {
-                size_t lines = 0;
-                std::istringstream iss(results[i].output);
-                std::string line;
-                while (std::getline(iss, line)) ++lines;
-                bench_lines[i] = lines;
-            }
+                char num_buf[64];
 
-            // Greedy assignment: fill columns to balance total lines
-            std::vector<std::vector<size_t>> col_indices(num_cols);
-            std::vector<size_t> col_line_totals(num_cols, 0);
-            for (size_t i = 0; i < num_bench; ++i) {
-                // Find column with least total lines
-                size_t min_col = 0;
-                for (size_t c = 1; c < num_cols; ++c)
-                if (col_line_totals[c] < col_line_totals[min_col]) min_col = c;
-                col_indices[min_col].push_back(i);
-                col_line_totals[min_col] += bench_lines[i];
-            }
+                gpu_json += "      \"gpu_idx\": ";
+                gpu_json += std::to_string(deviceId);
+                gpu_json += ",\n";
 
-            // Build columns: split output into lines, track max width
-            std::vector<std::vector<std::string>> columns(num_cols);
-            std::vector<size_t> col_widths(num_cols, 0);
-            for (int col = 0; col < num_cols; ++col) {
-                for (size_t idx : col_indices[col]) {
-                std::istringstream iss(results[idx].output);
-                std::string line;
-                while (std::getline(iss, line)) {
-                    columns[col].push_back(line);
-                    col_widths[col] = std::max(col_widths[col], line.size());
+                gpu_json += "      \"gpu_name\": \"";
+                gpu_json += jsonEscape(prop.name);
+                gpu_json += "\",\n";
+
+                snprintf(num_buf, sizeof(num_buf), "%d.%d", prop.major, prop.minor);
+                gpu_json += "      \"compute_capability\": \"";
+                gpu_json += num_buf;
+                gpu_json += "\",\n";
+
+                snprintf(num_buf, sizeof(num_buf), "%.4f",
+                         prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+                gpu_json += "      \"global_memory_gb\": ";
+                gpu_json += num_buf;
+                gpu_json += ",\n";
+
+                gpu_json += "      \"multiprocessors\": ";
+                gpu_json += std::to_string(prop.multiProcessorCount);
+                gpu_json += ",\n";
+
+                gpu_json += "      \"max_threads_per_block\": ";
+                gpu_json += std::to_string(prop.maxThreadsPerBlock);
+                gpu_json += ",\n";
+
+                snprintf(num_buf, sizeof(num_buf), "%04x:%02x:%02x.%d",
+                         prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, 0);
+                gpu_json += "      \"pci_bus_id\": \"";
+                gpu_json += num_buf;
+                gpu_json += "\",\n";
+
+                // gpu_numa is -1 when the NUMA node is unknown (Windows,
+                // single-NUMA systems, etc.).  Emit the raw integer so
+                // consumers can distinguish known nodes from unknown.
+                gpu_json += "      \"numa_node\": ";
+                gpu_json += std::to_string(gpu_numa);
+                gpu_json += ",\n";
+
+                gpu_json += "      \"l2_cache_kb\": ";
+                gpu_json += std::to_string(prop.l2CacheSize / 1024);
+                gpu_json += ",\n";
+
+                // mem_clock_khz / sm_clock_khz are in kHz; convert to MHz
+                // (rounded) to match the on-screen printout.
+                gpu_json += "      \"memory_clock_mhz\": ";
+                gpu_json += std::to_string((int)(mem_clock_khz * 1e-3));
+                gpu_json += ",\n";
+
+                gpu_json += "      \"sm_clock_mhz\": ";
+                gpu_json += std::to_string((int)(sm_clock_khz * 1e-3));
+                gpu_json += ",\n";
+
+                gpu_json += "      \"benchmark_results\": [\n";
+                for (size_t i = 0; i < results.size(); i++) {
+                    gpu_json += "        {\n";
+                    gpu_json += "          \"name\": \"";
+                    gpu_json += jsonEscape(results[i].name);
+                    gpu_json += "\",\n";
+                    gpu_json += "          \"results\": [\n";
+
+                    std::vector<BenchKV> kvs =
+                        parseBenchmarkOutput(results[i].output);
+                    for (size_t j = 0; j < kvs.size(); j++) {
+                        gpu_json += "            {\"";
+                        gpu_json += jsonEscape(kvs[j].key);
+                        gpu_json += "\": \"";
+                        gpu_json += jsonEscape(kvs[j].value);
+                        gpu_json += "\"}";
+                        if (j + 1 < kvs.size()) gpu_json += ",";
+                        gpu_json += "\n";
+                    }
+
+                    gpu_json += "          ]\n";
+                    gpu_json += "        }";
+                    if (i + 1 < results.size()) gpu_json += ",";
+                    gpu_json += "\n";
                 }
-                // Add a blank line between benchmarks
-                columns[col].push_back("");
-                }
+                gpu_json += "      ]\n";
+                gpu_json += "    }";
+
+                gpu_json_entries.push_back(gpu_json);
             }
 
-            // Find max lines per column
-            size_t max_lines = 0;
-            for (auto& col : columns)
-                max_lines = std::max(max_lines, col.size());
+            // ---------------------------------------------------------------
+            // Text output path (the side-by-side column layout).
+            // Skipped entirely in JSON mode — the data is in the JSON file.
+            // ---------------------------------------------------------------
+            if (!config.json_output_mode) {
+                // Print results in columns, balancing by output length (lines) per column
+                printf("\n--- Benchmark Results ---\n\n");
+                const int num_cols = 3;
+                size_t num_bench = results.size();
 
-            // Print each line of each column side by side
-            for (size_t line = 0; line < max_lines; ++line) {
-                for (size_t col = 0; col < num_cols; ++col) {
-                if (line < columns[col].size())
-                    printf("%-*s  ", (int)col_widths[col], columns[col][line].c_str());
-                else
-                    printf("%-*s  ", (int)col_widths[col], "");
+                // Count lines in each result
+                std::vector<size_t> bench_lines(num_bench, 0);
+                for (size_t i = 0; i < num_bench; ++i) {
+                    size_t lines = 0;
+                    std::istringstream iss(results[i].output);
+                    std::string line;
+                    while (std::getline(iss, line)) ++lines;
+                    bench_lines[i] = lines;
                 }
-                printf("\n");
-            }
+
+                // Greedy assignment: fill columns to balance total lines
+                std::vector<std::vector<size_t>> col_indices(num_cols);
+                std::vector<size_t> col_line_totals(num_cols, 0);
+                for (size_t i = 0; i < num_bench; ++i) {
+                    // Find column with least total lines
+                    size_t min_col = 0;
+                    for (size_t c = 1; c < num_cols; ++c)
+                    if (col_line_totals[c] < col_line_totals[min_col]) min_col = c;
+                    col_indices[min_col].push_back(i);
+                    col_line_totals[min_col] += bench_lines[i];
+                }
+
+                // Build columns: split output into lines, track max width
+                std::vector<std::vector<std::string>> columns(num_cols);
+                std::vector<size_t> col_widths(num_cols, 0);
+                for (int col = 0; col < num_cols; ++col) {
+                    for (size_t idx : col_indices[col]) {
+                    std::istringstream iss(results[idx].output);
+                    std::string line;
+                    while (std::getline(iss, line)) {
+                        columns[col].push_back(line);
+                        col_widths[col] = std::max(col_widths[col], line.size());
+                    }
+                    // Add a blank line between benchmarks
+                    columns[col].push_back("");
+                    }
+                }
+
+                // Find max lines per column
+                size_t max_lines = 0;
+                for (auto& col : columns)
+                    max_lines = std::max(max_lines, col.size());
+
+                // Print each line of each column side by side
+                for (size_t line = 0; line < max_lines; ++line) {
+                    for (size_t col = 0; col < num_cols; ++col) {
+                    if (line < columns[col].size())
+                        printf("%-*s  ", (int)col_widths[col], columns[col][line].c_str());
+                    else
+                        printf("%-*s  ", (int)col_widths[col], "");
+                    }
+                    printf("\n");
+                }
+            } // end if (!json_output_mode)
         } // End of device loop
+
+        // -------------------------------------------------------------------
+        // Write the JSON document to disk (only in JSON mode).
+        //
+        // All per-GPU JSON objects accumulated above are joined into a single
+        // top-level {"gpus": [ ... ]} document and written to
+        // config.json_output_file (default: cubench_results.json, override
+        // with --json-file on the command line).
+        // -------------------------------------------------------------------
+        if (config.json_output_mode) {
+            std::ofstream jf(config.json_output_file);
+            if (!jf.is_open()) {
+                fprintf(stderr,
+                        "Error: could not open '%s' for writing JSON output.\n",
+                        config.json_output_file.c_str());
+            } else {
+                jf << "{\n";
+                jf << "  \"gpus\": [\n";
+                for (size_t i = 0; i < gpu_json_entries.size(); i++) {
+                    jf << gpu_json_entries[i];
+                    if (i + 1 < gpu_json_entries.size()) jf << ",";
+                    jf << "\n";
+                }
+                jf << "  ]\n";
+                jf << "}\n";
+                jf.close();
+                printf("\nJSON results written to %s\n",
+                       config.json_output_file.c_str());
+            }
+        }
         
         printf("\n\n");
         printf("========================================================\n");
         printf("   ALL GPU BENCHMARKS COMPLETED!\n");
         printf("========================================================\n");
         
-        std::cout << "\nBenchmark completed! Press any key to quit.\n" << 
-        "You may need to zoom out your terminal to view all 3 result columns" << std::endl;
-        _getch();
+        // In headless mode we skip the interactive "press any key" prompt
+        // and exit immediately so the program can be driven from scripts /
+        // CI pipelines.  Headless mode is only allowed when JSON output is
+        // also enabled (validated in main()).
+        if (!config.headless_mode) {
+            std::cout << "\nBenchmark completed! Press any key to quit.\n" << 
+            "You may need to zoom out your terminal to view all 3 result columns" << std::endl;
+            _getch();
+        }
     }
 };
 
-int main() {
+// ----------------------------------------------------------------------------
+// Command-line usage.
+//
+//   cubench [--json] [--headless] [--json-file <path>]
+//
+//   (no flags)     Run all benchmarks and print results in 3 side-by-side
+//                  columns on stdout, then wait for a keypress before exit.
+//   --json         Enable JSON output mode.  Each benchmark's captured stdout
+//                  is parsed into key/value pairs and written to a JSON file
+//                  (default: cubench_results.json) instead of being printed
+//                  in the column layout.  Stdout still shows GPU info and a
+//                  progress bar on stderr; only the per-benchmark result
+//                  columns are replaced by the JSON file.
+//   --headless     Headless mode: skip the interactive "press any key to
+//                  quit" prompt and exit immediately once the JSON file has
+//                  been written.  Only valid together with --json (using
+//                  --headless without --json is a hard error).  Intended for
+//                  driving the benchmark from scripts / CI pipelines.
+//   --json-file P  Override the JSON output path (default: cubench_results.json).
+//                  Implied --json.  Only takes effect in JSON mode.
+//   --help, -h     Show this message and exit.
+// ----------------------------------------------------------------------------
+static void printUsage(const char* argv0) {
+    printf("Usage: %s [--json] [--headless] [--json-file <path>]\n\n", argv0);
+    printf("Options:\n");
+    printf("  --json              Enable JSON output mode (write results to a .json file\n");
+    printf("                      instead of the side-by-side column layout).\n");
+    printf("  --headless          Headless mode (requires --json): no interactive prompts,\n");
+    printf("                      exits immediately after the JSON file is written.\n");
+    printf("  --json-file <path>  JSON output file path (default: cubench_results.json).\n");
+    printf("  --help, -h          Show this help message and exit.\n");
+}
+
+int main(int argc, char* argv[]) {
     // Configure benchmark
     BenchmarkConfig config;
-    
+
+    // Parse command-line arguments.
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--json" || arg == "--json-output") {
+            config.json_output_mode = true;
+        } else if (arg == "--headless") {
+            config.headless_mode = true;
+        } else if (arg == "--json-file" || arg == "--json-output-file") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: %s requires a path argument.\n", arg.c_str());
+                return 1;
+            }
+            config.json_output_file = argv[++i];
+            // Specifying an output file implies JSON mode.
+            config.json_output_mode = true;
+        } else if (arg == "--help" || arg == "-h") {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "Error: unknown argument '%s'.\n\n", arg.c_str());
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    // Headless mode is only meaningful when JSON output is also enabled —
+    // without JSON there is no result file to produce, so a headless run
+    // would just discard all output.  Refuse rather than silently producing
+    // nothing.
+    if (config.headless_mode && !config.json_output_mode) {
+        fprintf(stderr,
+                "Error: --headless mode requires --json mode.\n"
+                "Headless mode is only available when JSON output mode is enabled,\n"
+                "because there is no result file to generate otherwise.\n\n");
+        printUsage(argv[0]);
+        return 1;
+    }
+
     // Detect all GPUs and create benchmark instances for each
     int deviceCount = 0;
     CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
